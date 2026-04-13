@@ -49,6 +49,7 @@
 #include <linux/kcov.h>
 #include <linux/kprobes.h>
 #include <linux/llist_api.h>
+#include <linux/memory_delegation.h>
 #include <linux/mmu_context.h>
 #include <linux/mmzone.h>
 #include <linux/mutex_api.h>
@@ -5873,6 +5874,11 @@ static __always_inline struct rq *
 context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next, struct rq_flags *rf)
 {
+	/*
+	 * Scheduler path is atomic; the hook only tags sync-needed state.
+	 */
+	memory_delegation_on_context_switch(prev, next);
+
 	prepare_task_switch(rq, prev, next);
 
 	/*

@@ -45,6 +45,7 @@
 #include <linux/version.h>
 #include <linux/ctype.h>
 #include <linux/syscall_user_dispatch.h>
+#include <linux/memory_delegation.h>
 
 #include <linux/compat.h>
 #include <linux/syscalls.h>
@@ -64,6 +65,7 @@
 #include <linux/rcupdate.h>
 #include <linux/uidgid.h>
 #include <linux/cred.h>
+#include <linux/slab.h>
 
 #include <linux/nospec.h>
 
@@ -2473,6 +2475,39 @@ static int prctl_get_auxv(void __user *addr, unsigned long len)
 	return sizeof(mm->saved_auxv);
 }
 
+static long prctl_set_memory_delegation_log(unsigned long arg2,
+					    unsigned long arg3,
+					    unsigned long arg4,
+					    unsigned long arg5)
+{
+	struct md_shadow_log *klog;
+	void __user *ulog = (void __user *)arg2;
+	unsigned int nr_entries = arg3;
+	unsigned int cpu = arg4;
+	unsigned long arena_base = arg5;
+	size_t bytes;
+	long ret;
+
+	if (!ulog || !nr_entries || !arena_base)
+		return -EINVAL;
+	if (nr_entries > 4096)
+		return -E2BIG;
+
+	bytes = (size_t)nr_entries * sizeof(*klog);
+	if (bytes / sizeof(*klog) != nr_entries)
+		return -EOVERFLOW;
+
+	// copy arena log from userspace to kernel
+	klog = memdup_user(ulog, bytes);
+	if (IS_ERR(klog))
+		return PTR_ERR(klog);
+
+	ret = memory_delegation_submit_log_and_sync(cpu, klog, nr_entries,
+						    arena_base);
+	kfree(klog);
+	return ret;
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2802,6 +2837,9 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		break;
 	case PR_RISCV_SET_ICACHE_FLUSH_CTX:
 		error = RISCV_SET_ICACHE_FLUSH_CTX(arg2, arg3);
+		break;
+	case PR_SET_MEMORY_DELEGATION_LOG:
+		error = prctl_set_memory_delegation_log(arg2, arg3, arg4, arg5);
 		break;
 	default:
 		error = -EINVAL;

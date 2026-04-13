@@ -1372,6 +1372,16 @@ config NUMA_EMU
 	  into virtual nodes when booted with "numa=fake=N", where N is the
 	  number of nodes. This is only useful for debugging.
 
+config MEMORY_DELEGATION
+	bool "Memory delegation kernel truth and sync framework"
+	depends on MMU && SMP
+	help
+	  Enable kernel-side ownership truth for userspace memory delegation.
+	  This adds per-CPU arena metadata (`page_slot`, `owner_table`,
+	  `chunk_gen`) and external per-mm sync context (`arena_mm_ctx`).
+	  The first version keeps userspace hot paths log-only and uses
+	  generation-based page-table revoke synchronization.
+
 source "mm/damon/Kconfig"
 
 endmenu
