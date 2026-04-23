@@ -102,6 +102,7 @@
 #include <linux/stackprotector.h>
 #include <linux/user_events.h>
 #include <linux/iommu.h>
+#include <linux/memory_delegation.h>
 #include <linux/rseq.h>
 #include <uapi/linux/pidfd.h>
 #include <linux/pidfs.h>
@@ -1345,6 +1346,7 @@ static inline void __mmput(struct mm_struct *mm)
 	exit_aio(mm);
 	ksm_exit(mm);
 	khugepaged_exit(mm); /* must run before exit_mmap */
+	memory_delegation_mm_release(mm);
 	exit_mmap(mm);
 	mm_put_huge_zero_folio(mm);
 	set_mm_exe_file(mm, NULL);
@@ -2449,6 +2451,7 @@ __latent_entropy struct task_struct *copy_process(
 	p->plug = NULL;
 #endif
 	futex_init_task(p);
+	p->task_works = NULL;
 
 	/*
 	 * sigaltstack should be cleared when sharing the same VM
@@ -2466,6 +2469,11 @@ __latent_entropy struct task_struct *copy_process(
 	clear_task_syscall_work(p, SYSCALL_EMU);
 #endif
 	clear_tsk_latency_tracing(p);
+	if (p->mm && !(clone_flags & CLONE_VM)) {
+		retval = memory_delegation_fork_mm(p, p->mm, current->mm);
+		if (retval)
+			goto bad_fork_put_pidfd;
+	}
 
 	/* ok, now we should be set up.. */
 	p->pid = pid_nr(pid);
@@ -2482,7 +2490,6 @@ __latent_entropy struct task_struct *copy_process(
 	p->dirty_paused_when = 0;
 
 	p->pdeath_signal = 0;
-	p->task_works = NULL;
 	clear_posix_cputimers_work(p);
 
 #ifdef CONFIG_KRETPROBES

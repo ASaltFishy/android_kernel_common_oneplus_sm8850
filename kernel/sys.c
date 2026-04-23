@@ -2480,32 +2480,17 @@ static long prctl_set_memory_delegation_log(unsigned long arg2,
 					    unsigned long arg4,
 					    unsigned long arg5)
 {
-	struct md_shadow_log *klog;
-	void __user *ulog = (void __user *)arg2;
 	unsigned int nr_entries = arg3;
 	unsigned int cpu = arg4;
 	unsigned long arena_base = arg5;
-	size_t bytes;
-	long ret;
 
-	if (!ulog || !nr_entries || !arena_base)
+	if (!arena_base)
 		return -EINVAL;
-	if (nr_entries > 4096)
-		return -E2BIG;
 
-	bytes = (size_t)nr_entries * sizeof(*klog);
-	if (bytes / sizeof(*klog) != nr_entries)
-		return -EOVERFLOW;
+	if (!nr_entries)
+		return memory_delegation_register_ring(cpu, arena_base, arg2);
 
-	// copy arena log from userspace to kernel
-	klog = memdup_user(ulog, bytes);
-	if (IS_ERR(klog))
-		return PTR_ERR(klog);
-
-	ret = memory_delegation_submit_log_and_sync(cpu, klog, nr_entries,
-						    arena_base);
-	kfree(klog);
-	return ret;
+	return -EOPNOTSUPP;
 }
 
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,

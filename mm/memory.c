@@ -69,6 +69,7 @@
 #include <linux/gfp.h>
 #include <linux/migrate.h>
 #include <linux/string.h>
+#include <linux/memory_delegation.h>
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
 #include <linux/userfaultfd_k.h>
@@ -5827,6 +5828,12 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 			vmf->pte = NULL;
 		}
 	}
+
+	if (!vmf->pte &&
+	    unlikely(!memory_delegation_fault_allowed(vmf->vma->vm_mm,
+						     vmf->address,
+						     vmf->vma)))
+		return VM_FAULT_SIGSEGV;
 
 	if (!vmf->pte)
 		return do_pte_missing(vmf);

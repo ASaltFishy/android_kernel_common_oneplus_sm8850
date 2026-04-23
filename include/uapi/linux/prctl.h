@@ -329,13 +329,12 @@ struct prctl_mm_map {
 # define PR_PPC_DEXCR_CTRL_MASK		0x1f
 
 /*
- * Submit memory delegation shadow logs and synchronously apply page-table
- * revocation for current->mm.
+ * Memory delegation ring registration.
  *
- * arg2: userspace pointer to struct md_shadow_log[]
- * arg3: number of entries in arg2
+ * arg2: userspace pointer to a struct md_log_ring page shared with the kernel
+ * arg3: must be 0
  * arg4: target per-CPU arena cpu id
- * arg5: arena base virtual address in current->mm
+ * arg5: arena data-base virtual address in current->mm
  */
 #define PR_SET_MEMORY_DELEGATION_LOG	74
 

@@ -10,64 +10,61 @@
 struct task_struct;
 
 #ifdef CONFIG_MEMORY_DELEGATION
-int memory_delegation_arena_register(unsigned int cpu, unsigned int arena_id,
-				     unsigned int nr_pages,
+int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 				     unsigned int owner_slots);
-void memory_delegation_arena_unregister(unsigned int cpu, unsigned int arena_id);
+void memory_delegation_arena_unregister(unsigned int cpu);
 
-int memory_delegation_submit_log(unsigned int cpu,
+int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
+				    unsigned long ring_addr);
+
+int memory_delegation_submit_log(unsigned int cpu, unsigned long arena_base,
 				 const struct md_shadow_log *log,
 				 unsigned int nr_entries);
-int memory_delegation_submit_log_and_sync(unsigned int cpu,
-					  const struct md_shadow_log *log,
-					  unsigned int nr_entries,
-					  unsigned long arena_base);
 
 void memory_delegation_on_context_switch(struct task_struct *prev,
 					 struct task_struct *next);
+int memory_delegation_fork_mm(struct task_struct *task, struct mm_struct *new_mm,
+			      struct mm_struct *old_mm);
+void memory_delegation_mm_release(struct mm_struct *mm);
 
 /*
  * Runs in process context with mmap_write_lock(mm) held.
  * Scans chunk generations and revokes stale mappings via unmap.
  */
 int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
-			      unsigned int arena_id,
 			      unsigned long arena_base);
 
 /*
  * Arena fault policy:
- *  - return true: owner still current mm, caller may restore mapping
- *  - return false: owner changed or page is free, caller must SIGSEGV
+ *  - return true: non-delegation faults or owner still current mm
+ *  - return false: registered delegation page is no longer owned by current mm
  */
-bool memory_delegation_fault_allowed(struct mm_struct *mm, unsigned int cpu,
-				     unsigned int arena_id,
-				     unsigned long arena_base,
-				     unsigned long address);
+bool memory_delegation_fault_allowed(struct mm_struct *mm,
+				     unsigned long address,
+				     const struct vm_area_struct *vma);
 #else
 static inline int memory_delegation_arena_register(unsigned int cpu,
-						   unsigned int arena_id,
 						   unsigned int nr_pages,
 						   unsigned int owner_slots)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline void memory_delegation_arena_unregister(unsigned int cpu,
-						      unsigned int arena_id)
+static inline void memory_delegation_arena_unregister(unsigned int cpu)
 {
 }
 
-static inline int memory_delegation_submit_log(unsigned int cpu,
-					       const struct md_shadow_log *log,
-					       unsigned int nr_entries)
+static inline int memory_delegation_register_ring(unsigned int cpu,
+						  unsigned long arena_base,
+						  unsigned long ring_addr)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline int memory_delegation_submit_log_and_sync(unsigned int cpu,
-							const struct md_shadow_log *log,
-							unsigned int nr_entries,
-							unsigned long arena_base)
+static inline int memory_delegation_submit_log(unsigned int cpu,
+					       unsigned long arena_base,
+					       const struct md_shadow_log *log,
+					       unsigned int nr_entries)
 {
 	return -EOPNOTSUPP;
 }
@@ -77,21 +74,29 @@ static inline void memory_delegation_on_context_switch(struct task_struct *prev,
 {
 }
 
+static inline int memory_delegation_fork_mm(struct task_struct *task,
+					    struct mm_struct *new_mm,
+					    struct mm_struct *old_mm)
+{
+	return 0;
+}
+
+static inline void memory_delegation_mm_release(struct mm_struct *mm)
+{
+}
+
 static inline int memory_delegation_sync_mm(struct mm_struct *mm,
 					    unsigned int cpu,
-					    unsigned int arena_id,
 					    unsigned long arena_base)
 {
 	return -EOPNOTSUPP;
 }
 
 static inline bool memory_delegation_fault_allowed(struct mm_struct *mm,
-						   unsigned int cpu,
-						   unsigned int arena_id,
-						   unsigned long arena_base,
-						   unsigned long address)
+						   unsigned long address,
+						   const struct vm_area_struct *vma)
 {
-	return false;
+	return true;
 }
 #endif
 

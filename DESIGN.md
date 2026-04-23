@@ -72,28 +72,6 @@ flowchart LR
   - 安全上下文：在持有 `mmap_write_lock(mm)` 时调用 `memory_delegation_sync_mm()` 执行实际 `unmap`。
 - 该约束不改变安全模型，但决定了“撤销映射”的实际触发点必须在可睡眠上下文中。
 
-2.9 显式同步挂接点（已确认并实现）
-- 第一版采用“用户态/内核交互点显式同步”：
-  - 用户态提交 shadow log 时，内核入口调用
-    `memory_delegation_submit_log_and_sync()`。
-  - 该入口内部先提交日志更新真值（`page_slot/owner_table/chunk_gen`），
-    再在同一交互链路下持有 `mmap_write_lock(current->mm)` 调用
-    `memory_delegation_sync_mm()`。
-- 该模式的目标是用最小复杂度保证正确性，避免在调度原子路径做可睡眠操作。
-- 后续若需要更低时延，再评估将同步触发点从显式调用扩展为更细粒度机制。
-
-2.10 用户态入口定义（第一版）
-- 第一版交互入口固定为 `prctl(PR_SET_MEMORY_DELEGATION_LOG, ...)`：
-  - `arg2`: `struct md_shadow_log[]` 用户态指针
-  - `arg3`: 日志条目数
-  - `arg4`: 目标 per-CPU arena 的 cpu id
-  - `arg5`: 当前 `mm` 中 arena 的基地址
-- 内核执行顺序：
-  - `copy_from_user` 拉取日志数组；
-  - `memory_delegation_submit_log_and_sync()`：
-    1. 提交日志更新真值；
-    2. 持 `mmap_write_lock(current->mm)` 执行 `memory_delegation_sync_mm()`；
-    3. 返回执行结果给用户态。
 
 ---
 三、 子课题二：智能应用感知的内核层资源协同优化
