@@ -42,15 +42,28 @@
 - `mm_ctx` 存储位置：只能使用外部 `arena_mm_ctx` 私有表，不改 `mm_struct`/`task_struct` 布局。
 - 跨核 free 延迟：第一版不实现阈值，默认可容忍一个调度周期内的延迟提交。
 
-2.6 `unmap` 后 page fault 的强制语义（安全红线）
-- 被 `unmap` 的 Arena 页在当前 `mm` 上访问时，必然触发缺页异常。
-- fault helper 必须先查 `page_slot[] + owner_table[]` 真值：
-  - 若 owner 仍是当前 `mm`：允许恢复映射。
-  - 若 owner 已是其他 `mm`：必须拒绝访问并返回 `SIGSEGV`。
-  - 若页为空闲 slot：同样拒绝访问，不允许走匿名页默认补页路径。
-- 结论：`unmap` 只是触发器，真正安全性由 fault 路由中的 ownership 判定保证。
+2.6 破局方案：定制 `vm_ops->fault` + 尽可能无锁（Lockless）查表（安全红线）
+目标：实现“硬件拦截 + 自动 SIGSEGV”，同时**绝对不修改** Linux 核心的 generic page fault 锁与匿名页缺页路径；把所有权校验与补页决策下沉到专用 VMA 的自定义 fault 慢路径中。
 
-2.7 内核侧架构图（第一版）
+- 硬件拦截（真正的零开销隔离）
+  - 在上下文切换等“安全时机”，针对“被借走/不再属于当前 mm”的页，直接清空对应 PTE（`pte_clear` / unmap PTE entry）。
+  - 这一步**不需要**做 VMA 分裂/改写（避免极其昂贵的 VMA 操作与 `mmap_write_lock`），也不触碰 generic fault 的全局锁机制。
+  - 只要 PTE 为空，任何越权访问必然被 MMU 打断并陷入内核，隔离成本为 0（在用户态热路径上）。
+
+- 自定义 fault 路由（避开通用匿名页补页）
+  - 将 Arena 的虚拟地址区间映射为“特殊 shared memory VMA”，并挂载自定义 `vm_operations_struct`（`arena_vma_ops`）。
+  - 缺页异常发生时，内核识别该 VMA 后，不走默认匿名页缺页分配逻辑，而是直接调用 `arena_vma_ops->fault`（这是我们允许变慢的 Slow Path）。
+
+- 极速无锁真值校验（核心设计）
+  - 在 `arena_vma_ops->fault` 中**禁止**引入 `spinlock`/`mutex`：首次访问与非法访问的区分必须靠无锁读真值表完成。
+  - 仍沿用 §2.3 的内核独占归属表 `page_slot[]`（页粒度 owner slot）。在 x86/ARM64 上，对 word 大小读取天然原子，可直接无锁读取 `page_slot[page_idx]`。
+  - 判定逻辑（返回语义必须严格）：
+    - 若 `page_slot[page_idx] == current_slot`：合法的首次访问（或合法的恢复访问）。分配/获取物理页，建立 PTE 映射，返回继续执行。
+    - 若 `page_slot[page_idx] == MD_INVALID_SLOT`：空闲页，访问合法，page fault放行，因为分配器需要访问free page中的元数据。
+    - 若 `page_slot[page_idx] != current_slot`：越权访问。**直接返回 `VM_FAULT_SIGSEGV`**，由内核向用户态递送 `SIGSEGV`。
+  - 结论：PTE 清空只是“硬件触发器”；真正的安全性与“首次/非法”判定完全由 `arena_vma_ops->fault` 内的无锁 ownership 校验保证。
+
+2.7 内核侧架构图（第一版，`vm_ops->fault` 路由）
 ```mermaid
 flowchart LR
     A[User Shadow Log] --> B[switch-out prev: drain log]
@@ -59,10 +72,11 @@ flowchart LR
     D --> E[switch-in next: linear scan chunk_gen]
     E --> F[unmap unauthorized PTE ranges]
     F --> G[Access fault]
-    G --> H{owner == current mm?}
-    H -- yes --> I[restore mapping]
-    H -- no --> J[VM_FAULT_SIGSEGV]
-    E --> K[arena_mm_ctx.last_seen_gen update]
+    G --> H[arena_vma_ops->fault]
+    H --> I{page_slot[page_idx] == current_slot?}
+    I -- yes --> J[alloc page + map PTE]
+    I -- no --> K[VM_FAULT_SIGSEGV]
+    E --> L[arena_mm_ctx.last_seen_gen update]
 ```
 
 2.8 ⚠ 调度路径实现约束（需严格遵守）
@@ -96,7 +110,5 @@ flowchart LR
 
 3.4 架构适配建议 (NPU DMA 内存池化)
 - (补充工程落地考量)：针对普通 DMA 映射难以“只释放其中一段连续物理页”的硬件限制，建议在系统层或 LLM 框架侧实现专属的 DMA 内存池 (DMA Memory Pool)。框架预先申请大块 DMA 内存，并在内部按层级管理 KV Cache。当内核下达回收指令时，框架配合解除局部映射，从而保证软硬件在页面粒度上的回收一致性。
-
-
 
 

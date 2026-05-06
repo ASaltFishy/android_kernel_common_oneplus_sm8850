@@ -99,9 +99,26 @@ static bool is_in_arena0(void *p) {
 
 static sigjmp_buf g_jmp;
 static volatile sig_atomic_t g_saw_segv = 0;
+static volatile sig_atomic_t g_expect_segv_touch = 0;
 
-static void on_segv(int signo) {
+static void on_segv(int signo, siginfo_t *info, void *ucontext) {
+  (void)ucontext;
   (void)signo;
+  const void *fault_addr = info ? info->si_addr : nullptr;
+  if (!g_expect_segv_touch) {
+    // SIGSEGV happened outside of expect_segv_on_touch()'s sigsetjmp scope.
+    // Don't siglongjmp into an uninitialized/irrelevant jmp buffer.
+    char buf[256];
+    const int n = snprintf(buf, sizeof(buf),
+                           "FAIL(scudo): unexpected SIGSEGV outside expect_segv_on_touch fault_addr=%p\n",
+                           fault_addr);
+    if (n > 0)
+      (void)write(STDERR_FILENO, buf,
+                   static_cast<size_t>(n) < sizeof(buf) ? (size_t)n
+                                                     : sizeof(buf));
+    _exit(1);
+  }
+
   g_saw_segv = 1;
   siglongjmp(g_jmp, 1);
 }
@@ -109,9 +126,9 @@ static void on_segv(int signo) {
 static void install_segv_handler(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = on_segv;
+  sa.sa_sigaction = on_segv;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_NODEFER;
+  sa.sa_flags = SA_NODEFER | SA_SIGINFO;
   if (sigaction(SIGSEGV, &sa, NULL) != 0)
     die("sigaction(SIGSEGV) failed errno=%d", errno);
 }
@@ -126,6 +143,7 @@ static void touch_rw(void *p, size_t n) {
 
 static void expect_segv_on_touch(void *p, size_t n) {
   g_saw_segv = 0;
+  g_expect_segv_touch = 1;
   if (sigsetjmp(g_jmp, 1) == 0) {
     touch_rw(p, n);
     // If we got here, no SIGSEGV happened.
@@ -133,6 +151,7 @@ static void expect_segv_on_touch(void *p, size_t n) {
   }
   if (!g_saw_segv)
     die("siglongjmp happened but g_saw_segv=0 (unexpected)");
+  g_expect_segv_touch = 0;
 }
 
 enum cmd_type : uint32_t {
@@ -205,6 +224,12 @@ static void child_main(int to_child, int to_parent, int child_idx) {
     } else if (m.type == CMD_ALLOC) {
       const size_t sz = (size_t)m.arg0;
       const uintptr_t Align = (uintptr_t)sysconf(_SC_PAGESIZE);
+
+      fprintf(stderr,
+              "child=%d pid=%d: CMD_ALLOC sz=%zu arena_core=%u sched_cpu=%d\n",
+              child_idx, getpid(), sz, (unsigned)Arena->getCoreId(),
+              (int)sched_getcpu());
+
       scudo::uptr CommitBase = 0, CommitSize = 0, EntryHeaderPos = 0;
       if (!Arena->retrieve((scudo::uptr)sz, (scudo::uptr)Align,
                            /*HeadersSize=*/0, CommitBase, CommitSize,
@@ -216,8 +241,20 @@ static void child_main(int to_child, int to_parent, int child_idx) {
       void *p = (void *)(uintptr_t)CommitBase;
       // retrieve() only appends to the shared log ring. Kernel commits ownership
       // on context switch, so yield before touching pages.
+      fprintf(stderr,
+              "child=%d pid=%d: yield_before_touch p=%p sz=%zu\n",
+              child_idx, getpid(), p, (size_t)CommitSize);
       yield_many(80);
+      fprintf(stderr,
+              "child=%d pid=%d: after_yield_before_touch p=%p sz=%zu\n",
+              child_idx, getpid(), p, (size_t)CommitSize);
+      fprintf(stderr,
+              "child=%d pid=%d: touch_rw start p=%p sz=%zu\n",
+              child_idx, getpid(), p, (size_t)CommitSize);
       touch_rw(p, (size_t)CommitSize);
+      fprintf(stderr,
+              "child=%d pid=%d: touch_rw done p=%p\n",
+              child_idx, getpid(), p);
       yield_many(20);
 
       owned = p;
@@ -261,6 +298,16 @@ int main(void) {
   // Make the test robust even if env-cache initialization happens before main().
   // This forces SharedArenaPool::shouldUseArena() to return true.
   scudo::setSharedArenaForceForTesting(true);
+
+  // Debug mode: only initialize the pool and exit, to validate kernel/userspace
+  // wiring on a physical device without stressing revoke/fault paths.
+  const char *mode = getenv("SCUDO_SHARED_ARENA_TEST_MODE");
+  if (mode && mode[0] != '\0' && strcmp(mode, "init_only") == 0) {
+    scudo::SharedArenaPool &Pool = scudo::SharedArenaPool::getInstance();
+    Pool.init();
+    fprintf(stderr, "MODE(init_only): pool_ready=%d\n", Pool.isReady() ? 1 : 0);
+    return Pool.isReady() ? 0 : 1;
+  }
 
   // Warm-up: populate free list in SharedArena (best-effort).
   // Use large allocations to force the Secondary allocator (SharedArena is in
@@ -321,7 +368,19 @@ int main(void) {
   uintptr_t last_addr = 0;
 
   const size_t alloc_sz = 32U << 20; // 32MB (force Secondary)
-  for (int round = 0; round < N * 2; round++) {
+  int max_rounds = N * 2;
+  {
+    const char *mr = getenv("SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS");
+    if (mr && mr[0] != '\0') {
+      long v = strtol(mr, nullptr, 10);
+      if (v > 0)
+        max_rounds = (v < (long)N * 2) ? (int)v : (N * 2);
+      fprintf(stderr,
+              "TEST_CFG: SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=%s => %d/%d\n",
+              mr, max_rounds, N * 2);
+    }
+  }
+  for (int round = 0; round < max_rounds; round++) {
     const int owner = round % N;
 
     fprintf(stderr, "round=%d owner=%d: alloc...\n", round, owner);

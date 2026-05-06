@@ -39,6 +39,7 @@ struct md_arena_meta {
 	u32 owner_slots;
 	u64 global_commit_seq;
 	u8 *page_slot;
+	u8 *page_free;
 	u32 *page_owner_gen;
 	u64 *chunk_gen;
 	struct md_owner_entry *owner_table;
@@ -66,6 +67,27 @@ static DEFINE_MUTEX(md_arena_table_lock);
 static DEFINE_HASHTABLE(md_mm_ctx_table, MD_MM_CTX_HASH_BITS);
 static DEFINE_SPINLOCK(md_mm_ctx_table_lock);
 static struct md_arena_meta __rcu *md_arenas[NR_CPUS];
+
+struct md_vma_wrap {
+	const struct vm_operations_struct *orig_ops;
+	unsigned int cpu;
+	unsigned long arena_base; /* userspace DataBase (not header base) */
+	struct vm_area_struct *owner_vma;
+};
+
+static vm_fault_t md_arena_vma_fault(struct vm_fault *vmf);
+static vm_fault_t md_arena_vma_page_mkwrite(struct vm_fault *vmf);
+static void md_arena_vma_open(struct vm_area_struct *vma);
+static void md_arena_vma_close(struct vm_area_struct *vma);
+
+static const struct vm_operations_struct md_arena_vm_ops = {
+	.open = md_arena_vma_open,
+	.close = md_arena_vma_close,
+	.fault = md_arena_vma_fault,
+	.page_mkwrite = md_arena_vma_page_mkwrite,
+};
+
+static void md_drain_log_ring(struct md_mm_ctx *ctx);
 
 /*
  * Number of arenas currently registered.  Incremented under md_arena_table_lock
@@ -116,6 +138,16 @@ static inline bool md_page_belongs_to_mm_locked(const struct md_arena_meta *aren
 	return owner->valid && owner->mm == mm && owner->gen == page_gen;
 }
 
+static inline bool md_page_accessible_to_mm_locked(const struct md_arena_meta *arena,
+						   u32 page_idx,
+						   struct mm_struct *mm)
+{
+	if (arena->page_slot[page_idx] == MD_INVALID_SLOT)
+		return true;
+
+	return md_page_belongs_to_mm_locked(arena, page_idx, mm);
+}
+
 static inline unsigned long md_mm_ctx_hash(const struct md_mm_ctx_key *key)
 {
 	return hash_long(hash_ptr(key->mm, MD_MM_CTX_HASH_BITS) ^ key->cpu,
@@ -135,6 +167,13 @@ static struct md_mm_ctx *md_mm_ctx_lookup_locked(const struct md_mm_ctx_key *key
 	return NULL;
 }
 
+/*
+	use reference count to maintain lifecycle of md_mm_ctx
+	if ref=0, free md_mm_ctx
+	与之对应：
+	md_mm_ctx_get_or_create：用于获取或创建 md_mm_ctx 上下文（基于 mm_struct 和 CPU），并增加引用计数。如果上下文不存在，会创建新的；如果存在，会直接增加引用计数返回。
+	md_mm_ctx_lookup_get：用于查找已存在的 md_mm_ctx 上下文（同样基于 mm_struct 和 CPU），并增加引用计数。如果找到，则返回并增加引用；否则返回 NULL。
+*/
 static void md_mm_ctx_put(struct md_mm_ctx *ctx)
 {
 	if (refcount_dec_and_test(&ctx->refs)) {
@@ -213,6 +252,195 @@ static struct md_arena_meta *md_get_arena_rcu(unsigned int cpu)
 		return NULL;
 
 	return rcu_dereference(md_arenas[cpu]);
+}
+
+static inline bool md_vma_is_wrapped(const struct vm_area_struct *vma)
+{
+	return vma && vma->vm_ops == &md_arena_vm_ops;
+}
+
+static struct md_vma_wrap *md_vma_wrap_get(const struct vm_area_struct *vma)
+{
+	if (!vma)
+		return NULL;
+	if (vma->vm_ops != &md_arena_vm_ops)
+		return NULL;
+	return (struct md_vma_wrap *)vma->vm_private_data;
+}
+
+static bool md_fault_addr_allowed(const struct vm_area_struct *vma,
+				  unsigned long address)
+{
+	struct md_vma_wrap *wrap;
+	struct md_arena_meta *arena;
+	unsigned long offset;
+	u32 page_idx;
+	bool allowed = false;
+	u8 slot;
+
+	if (!vma)
+		return true;
+
+	wrap = md_vma_wrap_get(vma);
+	if (!wrap)
+		return true;
+
+	if (address < wrap->arena_base)
+		return false;
+
+	offset = address - wrap->arena_base;
+	page_idx = offset >> PAGE_SHIFT;
+
+	rcu_read_lock();
+	arena = md_get_arena_rcu(wrap->cpu);
+	if (arena && page_idx < arena->nr_pages) {
+		slot = READ_ONCE(arena->page_slot[page_idx]);
+		/*
+		 * 空闲页（MD_INVALID_SLOT）里存放 SharedArena 的 freelist
+		 * 元数据。允许其 fault 通过，否则一旦空闲页的 PTE
+		 * 被撤销（sync/unmap），用户态在 retrieve/free-list scan
+		 * 时会触发 SIGSEGV。
+		 *
+		 * 仅当页属于“其他 mm 的已分配所有权”时拒绝。
+		 */
+		if (slot == MD_INVALID_SLOT) {
+			allowed = true;
+		} else {
+			allowed = md_page_belongs_to_mm(arena, page_idx, vma->vm_mm);
+		}
+	}
+	rcu_read_unlock();
+
+	return allowed;
+}
+
+static bool md_fault_addr_owned(const struct vm_area_struct *vma,
+				unsigned long address)
+{
+	return md_fault_addr_allowed(vma, address);
+}
+
+// VMA 被创建或者分裂时调用
+static void md_arena_vma_open(struct vm_area_struct *vma)
+{
+	struct md_vma_wrap *wrap = md_vma_wrap_get(vma);
+	struct md_vma_wrap *new_wrap;
+
+	/*
+	 * VMA split/dup can copy vm_private_data. Ensure each VMA owns its wrap.
+	 */
+	if (wrap && wrap->owner_vma != vma) {
+		new_wrap = kmemdup(wrap, sizeof(*wrap), GFP_KERNEL);
+		if (new_wrap) {
+			new_wrap->owner_vma = vma;
+			vma->vm_private_data = new_wrap;
+		}
+	}
+
+	wrap = md_vma_wrap_get(vma);
+	if (wrap && wrap->orig_ops && wrap->orig_ops->open)
+		wrap->orig_ops->open(vma);
+}
+
+// VMA 销毁时调用
+static void md_arena_vma_close(struct vm_area_struct *vma)
+{
+	struct md_vma_wrap *wrap = md_vma_wrap_get(vma);
+
+	if (!wrap)
+		return;
+
+	if (wrap->orig_ops && wrap->orig_ops->close)
+		wrap->orig_ops->close(vma);
+
+	kfree(wrap);
+	vma->vm_private_data = NULL;
+}
+
+static vm_fault_t md_arena_vma_fault(struct vm_fault *vmf)
+{
+	struct md_vma_wrap *wrap;
+
+	wrap = md_vma_wrap_get(vmf->vma);
+	if (!wrap)
+		return VM_FAULT_SIGSEGV;
+
+	if (unlikely(!md_fault_addr_allowed(vmf->vma, vmf->address)))
+		return VM_FAULT_SIGSEGV;
+
+	if (!wrap || !wrap->orig_ops || !wrap->orig_ops->fault)
+		return VM_FAULT_SIGSEGV;
+
+	return wrap->orig_ops->fault(vmf);
+}
+
+// 对只读或者CoW页面进行写操作时产生写保护异常
+static vm_fault_t md_arena_vma_page_mkwrite(struct vm_fault *vmf)
+{
+	struct md_vma_wrap *wrap = md_vma_wrap_get(vmf->vma);
+
+	if (unlikely(!md_fault_addr_owned(vmf->vma, vmf->address)))
+		return VM_FAULT_SIGSEGV;
+
+	if (!wrap || !wrap->orig_ops || !wrap->orig_ops->page_mkwrite)
+		return 0;
+
+	return wrap->orig_ops->page_mkwrite(vmf);
+}
+
+static int md_install_vma_ops(struct mm_struct *mm, unsigned int cpu,
+			      unsigned long arena_base, u32 nr_pages)
+{
+	struct vm_area_struct *vma;
+	unsigned long end = arena_base + (unsigned long)nr_pages * PAGE_SIZE;
+	struct md_vma_wrap *wrap;
+
+	if (!mm || cpu >= nr_cpu_ids || !arena_base || !nr_pages)
+		return -EINVAL;
+
+	mmap_assert_write_locked(mm);
+
+	vma = find_vma(mm, arena_base);
+	if (!vma || arena_base < vma->vm_start)
+		return -EINVAL;
+	if (vma->vm_end < end)
+		return -EINVAL;
+	if (!(vma->vm_flags & VM_SHARED) || !vma->vm_file)
+		return -EINVAL;
+
+	/* Idempotent: already installed. */
+	if (md_vma_is_wrapped(vma)) {
+		wrap = md_vma_wrap_get(vma);
+		if (!wrap)
+			return -EINVAL;
+		if (wrap->cpu != cpu || wrap->arena_base != arena_base)
+			return -EINVAL;
+		return 0;
+	}
+
+	/*
+	 * Do not clobber mappings whose vm_private_data is in use by other vm_ops.
+	 * Today SharedArena uses shmem/tmpfs (shmem_vm_ops) which does not use
+	 * vm_private_data in this tree, so storing wrap here is safe.
+	 */
+	if (vma->vm_private_data)
+		return -EBUSY;
+
+	wrap = kzalloc(sizeof(*wrap), GFP_KERNEL);
+	if (!wrap)
+		return -ENOMEM;
+
+	wrap->orig_ops = vma->vm_ops;
+	wrap->cpu = cpu;
+	wrap->arena_base = arena_base;
+	wrap->owner_vma = vma;
+
+	vma->vm_private_data = wrap;
+	vma->vm_ops = &md_arena_vm_ops;
+
+	/* Ensure open() is run for consistency with other vm_ops users. */
+	md_arena_vma_open(vma);
+	return 0;
 }
 
 static struct md_arena_meta *md_get_or_create_arena(unsigned int cpu,
@@ -322,6 +550,23 @@ static int md_unmap_range_locked(struct mm_struct *mm, unsigned long start,
 		unmap_end = min(end, vma->vm_end);
 		zap_page_range_single(vma, cursor, unmap_end - cursor, NULL);
 		cursor = unmap_end;
+	}
+
+	return 0;
+}
+
+static int md_prefault_range_locked(struct mm_struct *mm, unsigned long start,
+				    unsigned long end)
+{
+	unsigned long addr;
+
+	for (addr = start; addr < end; addr += PAGE_SIZE) {
+		int ret;
+
+		// 这里不会再走vma_fault的检查路径，直接创建映射
+		ret = fixup_user_fault(mm, addr, FAULT_FLAG_WRITE, NULL);
+		if (ret)
+			return ret;
 	}
 
 	return 0;
@@ -572,9 +817,10 @@ static void md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 				    struct task_struct *task, u64 latest_seq)
 {
 	bool queue = false;
+	unsigned long arena_base = READ_ONCE(ctx->arena_base);
 
 	spin_lock(&ctx->lock);
-	if (ctx->arena_base && latest_seq > ctx->last_seen_gen &&
+	if (arena_base && latest_seq > ctx->last_seen_gen &&
 	    !ctx->sync_queued) {
 		ctx->sync_queued = true;
 		refcount_inc(&ctx->refs);
@@ -593,14 +839,16 @@ static void md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 	}
 }
 
+// 在可睡眠上下文中实际进行当前arena PTE的修改（只改了next的PTE）
 static void md_sync_task_work(struct callback_head *work)
 {
 	struct md_mm_ctx *ctx = container_of(work, struct md_mm_ctx, sync_work);
 	struct mm_struct *mm = current->mm;
+	unsigned long arena_base = READ_ONCE(ctx->arena_base);
 
 	if (mm == ctx->key.mm && mm) {
 		mmap_write_lock(mm);
-		memory_delegation_sync_mm(mm, ctx->key.cpu, ctx->arena_base);
+		memory_delegation_sync_mm(mm, ctx->key.cpu, arena_base);
 		mmap_write_unlock(mm);
 	}
 
@@ -642,17 +890,19 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 	spin_lock_init(&arena->lock);
 
 	arena->page_slot = kvzalloc(nr_pages, GFP_KERNEL);
+	arena->page_free = kvzalloc(nr_pages, GFP_KERNEL);
 	arena->page_owner_gen = kvcalloc(nr_pages, sizeof(*arena->page_owner_gen),
 					 GFP_KERNEL);
 	arena->chunk_gen = kvcalloc(arena->nr_chunks, sizeof(*arena->chunk_gen),
 				    GFP_KERNEL);
 	arena->owner_table = kvcalloc(owner_slots, sizeof(*arena->owner_table),
 				      GFP_KERNEL);
-	if (!arena->page_slot || !arena->page_owner_gen ||
+	if (!arena->page_slot || !arena->page_free || !arena->page_owner_gen ||
 	    !arena->chunk_gen || !arena->owner_table) {
 		kvfree(arena->owner_table);
 		kvfree(arena->chunk_gen);
 		kvfree(arena->page_owner_gen);
+		kvfree(arena->page_free);
 		kvfree(arena->page_slot);
 		kfree(arena);
 		return -ENOMEM;
@@ -668,6 +918,7 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 		kvfree(arena->owner_table);
 		kvfree(arena->chunk_gen);
 		kvfree(arena->page_owner_gen);
+		kvfree(arena->page_free);
 		kvfree(arena->page_slot);
 		kfree(arena);
 		return (old_arena->nr_pages == nr_pages &&
@@ -703,6 +954,7 @@ void memory_delegation_arena_unregister(unsigned int cpu)
 	kvfree(arena->owner_table);
 	kvfree(arena->chunk_gen);
 	kvfree(arena->page_owner_gen);
+	kvfree(arena->page_free);
 	kvfree(arena->page_slot);
 	kfree(arena);
 }
@@ -715,6 +967,7 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 	struct md_mm_ctx *ctx;
 	u32 nr_pages = 0;
 	int ret;
+	unsigned long prev;
 
 	if (cpu >= nr_cpu_ids || !arena_base || !ring_addr)
 		return -EINVAL;
@@ -733,11 +986,31 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 		goto out_put_ctx;
 	}
 
+	/*
+	 * ctx->arena_base is write-once.  After it becomes non-zero it must not
+	 * change, so hot-path readers can use READ_ONCE() without taking ctx->lock.
+	 */
+	prev = cmpxchg(&ctx->arena_base, 0UL, arena_base);
+	if (prev && prev != arena_base) {
+		ret = -EINVAL;
+		goto out_put_ctx;
+	}
+
 	spin_lock(&ctx->lock);
-	ctx->arena_base = arena_base;
 	if (ctx->ring_page && arena->nr_pages != nr_pages)
 		ret = -EINVAL;
 	spin_unlock(&ctx->lock);
+
+	/*
+	 * Attach a dedicated VMA fault handler to the arena mapping, so the
+	 * ownership check and SIGSEGV decision are made in vm_ops->fault instead
+	 * of the generic anonymous fault path.
+	 */
+	if (!ret) {
+		mmap_write_lock(current->mm);
+		ret = md_install_vma_ops(current->mm, cpu, arena_base, arena->nr_pages);
+		mmap_write_unlock(current->mm);
+	}
 out_put_ctx:
 	md_mm_ctx_put(ctx);
 	return ret;
@@ -782,9 +1055,7 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 
 		prev_ctx = md_mm_ctx_lookup_get(prev->mm, cpu);
 		if (prev_ctx) {
-			spin_lock(&prev_ctx->lock);
-			arena_base = prev_ctx->arena_base;
-			spin_unlock(&prev_ctx->lock);
+			arena_base = READ_ONCE(prev_ctx->arena_base);
 
 			if (arena_base)
 				md_drain_log_ring(prev_ctx);
@@ -815,9 +1086,13 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 }
 EXPORT_SYMBOL_GPL(memory_delegation_on_context_switch);
 
-static int md_snapshot_chunk_ownership(struct mm_struct *mm, unsigned int cpu,
-				       u32 chunk, u64 last_seen, bool owned[],
-				       u32 *out_start_page, u32 *out_end_page)
+/*
+	对chunk内每个页面的dirty状态进行检查
+*/
+static int md_snapshot_chunk_state(struct mm_struct *mm, unsigned int cpu,
+				   u32 chunk, u64 last_seen, bool accessible[],
+				   bool free_pages[],
+				   u32 *out_start_page, u32 *out_end_page)
 {
 	struct md_arena_meta *arena;
 	u32 start_page;
@@ -830,6 +1105,8 @@ static int md_snapshot_chunk_ownership(struct mm_struct *mm, unsigned int cpu,
 		rcu_read_unlock();
 		return -ENOENT;
 	}
+
+	// chunk 已经是最新，直接返回
 	if (chunk >= arena->nr_chunks ||
 	    READ_ONCE(arena->chunk_gen[chunk]) <= last_seen) {
 		rcu_read_unlock();
@@ -845,9 +1122,12 @@ static int md_snapshot_chunk_ownership(struct mm_struct *mm, unsigned int cpu,
 		rcu_read_unlock();
 		return 1;
 	}
-	for (page = start_page; page < end_page; page++)
-		owned[page - start_page] =
-			md_page_belongs_to_mm_locked(arena, page, mm);
+	for (page = start_page; page < end_page; page++) {
+		free_pages[page - start_page] =
+			arena->page_slot[page] == MD_INVALID_SLOT;
+		accessible[page - start_page] =
+			md_page_accessible_to_mm_locked(arena, page, mm);
+	}
 	spin_unlock(&arena->lock);
 	rcu_read_unlock();
 
@@ -856,6 +1136,9 @@ static int md_snapshot_chunk_ownership(struct mm_struct *mm, unsigned int cpu,
 	return 0;
 }
 
+/*
+	实际处理修改 PTE 的函数
+*/
 int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 			      unsigned long arena_base)
 {
@@ -865,7 +1148,8 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 	u64 target_seq;
 	u32 nr_chunks;
 	u32 chunk;
-	bool owned[MD_CHUNK_PAGES];
+	bool accessible[MD_CHUNK_PAGES];
+	bool free_pages[MD_CHUNK_PAGES];
 	int ret = 0;
 
 	if (!mm || cpu >= nr_cpu_ids || !arena_base)
@@ -901,11 +1185,13 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 		u32 page;
 		u32 run_start = 0;
 		bool in_run = false;
+		u32 free_run_start = 0;
+		bool in_free_run = false;
 		int snap_ret;
 
-		snap_ret = md_snapshot_chunk_ownership(mm, cpu, chunk, last_seen,
-					      owned, &start_page,
-					      &end_page);
+		snap_ret = md_snapshot_chunk_state(mm, cpu, chunk, last_seen,
+						   accessible, free_pages,
+						   &start_page, &end_page);
 		if (snap_ret == 1)
 			continue;
 		if (snap_ret) {
@@ -914,14 +1200,15 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 		}
 
 		for (page = start_page; page < end_page; page++) {
-			bool page_owned = owned[page - start_page];
+			bool page_accessible = accessible[page - start_page];
 
-			if (!page_owned && !in_run) {
+			// in_run状态位表示正在处理一个不可访问页面的连续段，进行unmap
+			if (!page_accessible && !in_run) {
 				in_run = true;
 				run_start = page;
 				continue;
 			}
-			if (page_owned && in_run) {
+			if (page_accessible && in_run) {
 				unsigned long start = arena_base +
 					(unsigned long)run_start * PAGE_SIZE;
 				unsigned long end = arena_base +
@@ -929,14 +1216,47 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 				md_unmap_range_locked(mm, start, end);
 				in_run = false;
 			}
+
+			// in_free_run表示正在处理一个空闲页面的连续段
+			if (free_pages[page - start_page] && !in_free_run) {
+				in_free_run = true;
+				free_run_start = page;
+				continue;
+			}
+			if (!free_pages[page - start_page] && in_free_run) {
+				unsigned long start = arena_base +
+					(unsigned long)free_run_start * PAGE_SIZE;
+				unsigned long end = arena_base +
+					(unsigned long)page * PAGE_SIZE;
+
+				ret = md_prefault_range_locked(mm, start, end);
+				if (ret)
+					break;
+				in_free_run = false;
+			}
 		}
 
+		if (ret)
+			break;
+
+		// 尾端剩余页面
 		if (in_run) {
 			unsigned long start = arena_base +
 				(unsigned long)run_start * PAGE_SIZE;
 			unsigned long end = arena_base +
 				(unsigned long)end_page * PAGE_SIZE;
 			md_unmap_range_locked(mm, start, end);
+		}
+
+		if (in_free_run) {
+			unsigned long start = arena_base +
+				(unsigned long)free_run_start * PAGE_SIZE;
+			unsigned long end = arena_base +
+				(unsigned long)end_page * PAGE_SIZE;
+
+			ret = md_prefault_range_locked(mm, start, end);
+			if (ret)
+				break;
 		}
 	}
 
@@ -969,9 +1289,7 @@ int memory_delegation_fork_mm(struct task_struct *task, struct mm_struct *new_mm
 		if (!old_ctx)
 			continue;
 
-		spin_lock(&old_ctx->lock);
-		arena_base = old_ctx->arena_base;
-		spin_unlock(&old_ctx->lock);
+		arena_base = READ_ONCE(old_ctx->arena_base);
 		md_mm_ctx_put(old_ctx);
 
 		if (!arena_base)
@@ -981,8 +1299,13 @@ int memory_delegation_fork_mm(struct task_struct *task, struct mm_struct *new_mm
 		if (!new_ctx)
 			return -ENOMEM;
 
+		/*
+		 * Carry over the parent's write-once arena_base.  If userspace
+		 * later tries to register a different base for this (mm,cpu),
+		 * memory_delegation_register_ring() will reject it.
+		 */
+		WRITE_ONCE(new_ctx->arena_base, arena_base);
 		spin_lock(&new_ctx->lock);
-		new_ctx->arena_base = arena_base;
 		new_ctx->last_seen_gen = 0;
 		spin_unlock(&new_ctx->lock);
 
@@ -1080,6 +1403,10 @@ bool memory_delegation_fault_allowed(struct mm_struct *mm,
 	if (!mm || !vma)
 		return true;
 
+	/* Arena VMA is handled by md_arena_vm_ops->fault. */
+	if (md_vma_is_wrapped(vma))
+		return true;
+
 	/* Fast path: no arena registered system-wide, skip all locking. */
 	if (!atomic_read(&md_active_arenas))
 		return true;
@@ -1096,9 +1423,7 @@ bool memory_delegation_fault_allowed(struct mm_struct *mm,
 		if (!ctx)
 			continue;
 
-		spin_lock(&ctx->lock);
-		arena_base = ctx->arena_base;
-		spin_unlock(&ctx->lock);
+		arena_base = READ_ONCE(ctx->arena_base);
 		if (!arena_base || address < arena_base) {
 			md_mm_ctx_put(ctx);
 			continue;
