@@ -83,7 +83,7 @@ flowchart LR
 - `context_switch()` 处于原子上下文，不能执行可能睡眠的 `mmap_write_lock` 与 `zap_page_range`。
 - 因此第一版内核实现拆为两段：
   - 调度路径：仅更新 generation 和标记 `needs_pt_sync`。
-  - 安全上下文：在持有 `mmap_write_lock(mm)` 时调用 `memory_delegation_sync_mm()` 执行实际 `unmap`。
+  - 安全上下文：在持有 `mmap_write_lock(mm)` 时调用 `memory_delegation_sync_mm()` 执行实际 `unmap`。针对free的页面（注意是bump指针之前的部分）做prefault操作防止用户态分配器访问时触发fault
 - 该约束不改变安全模型，但决定了“撤销映射”的实际触发点必须在可睡眠上下文中。
 
 

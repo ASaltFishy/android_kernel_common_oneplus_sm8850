@@ -19,6 +19,7 @@
 #define MD_INVALID_SLOT 0xff
 #define MD_CHUNK_PAGES 64
 #define MD_MM_CTX_HASH_BITS 10
+#define MD_ACTIVE_MM_HASH_BITS 10
 #define MD_SHARED_ARENA_CAPACITY	(256UL * 1024 * 1024)
 #define MD_SHARED_ARENA_HEADER_SIZE	PAGE_SIZE
 #define MD_SHARED_ARENA_NR_PAGES	\
@@ -60,11 +61,19 @@ struct md_mm_ctx {
 	struct page *ring_page;
 	u64 last_seen_gen;
 	bool sync_queued;
+	bool active;
 	bool dead;
+};
+
+struct md_active_mm {
+	struct hlist_node node;
+	struct mm_struct *mm;
+	u32 nr_ctxs;
 };
 
 static DEFINE_MUTEX(md_arena_table_lock);
 static DEFINE_HASHTABLE(md_mm_ctx_table, MD_MM_CTX_HASH_BITS);
+static DEFINE_HASHTABLE(md_active_mm_table, MD_ACTIVE_MM_HASH_BITS);
 static DEFINE_SPINLOCK(md_mm_ctx_table_lock);
 static struct md_arena_meta __rcu *md_arenas[NR_CPUS];
 
@@ -96,6 +105,7 @@ static void md_drain_log_ring(struct md_mm_ctx *ctx);
  * return immediately without acquiring any other lock.
  */
 static atomic_t md_active_arenas = ATOMIC_INIT(0);
+static atomic_t md_active_mms = ATOMIC_INIT(0);
 
 static inline u32 md_chunk_of_page(u32 page_idx)
 {
@@ -165,6 +175,120 @@ static struct md_mm_ctx *md_mm_ctx_lookup_locked(const struct md_mm_ctx_key *key
 	}
 
 	return NULL;
+}
+
+static unsigned long md_active_mm_hash(struct mm_struct *mm)
+{
+	return hash_ptr(mm, MD_ACTIVE_MM_HASH_BITS);
+}
+
+static struct md_active_mm *md_active_mm_lookup_locked(struct mm_struct *mm)
+{
+	struct md_active_mm *active;
+
+	hash_for_each_possible(md_active_mm_table, active, node,
+			       md_active_mm_hash(mm)) {
+		if (active->mm == mm)
+			return active;
+	}
+
+	return NULL;
+}
+
+static bool md_active_mm_get_locked(struct mm_struct *mm,
+				    struct md_active_mm *new_active)
+{
+	struct md_active_mm *active;
+
+	active = md_active_mm_lookup_locked(mm);
+	if (active) {
+		active->nr_ctxs++;
+		kfree(new_active);
+		return true;
+	}
+
+	if (!new_active)
+		return false;
+
+	new_active->mm = mm;
+	new_active->nr_ctxs = 1;
+	hash_add(md_active_mm_table, &new_active->node, md_active_mm_hash(mm));
+	atomic_inc(&md_active_mms);
+	return true;
+}
+
+static int md_mm_ctx_activate(struct md_mm_ctx *ctx, gfp_t gfp)
+{
+	struct md_active_mm *new_active;
+	bool activated = false;
+	int ret = 0;
+
+	if (!ctx)
+		return -EINVAL;
+
+	spin_lock(&md_mm_ctx_table_lock);
+	if (ctx->dead) {
+		spin_unlock(&md_mm_ctx_table_lock);
+		return -EINVAL;
+	}
+	if (ctx->active) {
+		spin_unlock(&md_mm_ctx_table_lock);
+		return 0;
+	}
+	spin_unlock(&md_mm_ctx_table_lock);
+
+	new_active = kzalloc(sizeof(*new_active), gfp);
+	if (!new_active)
+		return -ENOMEM;
+
+	spin_lock(&md_mm_ctx_table_lock);
+	if (!ctx->dead && !ctx->active) {
+		if (!md_active_mm_get_locked(ctx->key.mm, new_active)) {
+			spin_unlock(&md_mm_ctx_table_lock);
+			kfree(new_active);
+			return -ENOMEM;
+		}
+		ctx->active = true;
+		activated = true;
+	}
+	if (ctx->dead)
+		ret = -EINVAL;
+	spin_unlock(&md_mm_ctx_table_lock);
+
+	if (!activated)
+		kfree(new_active);
+
+	return ret;
+}
+
+static void md_active_mm_put_locked(struct mm_struct *mm)
+{
+	struct md_active_mm *active;
+
+	active = md_active_mm_lookup_locked(mm);
+	if (!active)
+		return;
+
+	if (--active->nr_ctxs)
+		return;
+
+	hash_del(&active->node);
+	atomic_dec(&md_active_mms);
+	kfree(active);
+}
+
+static bool md_mm_has_active_ctx(struct mm_struct *mm)
+{
+	bool active;
+
+	if (!mm || !atomic_read(&md_active_mms))
+		return false;
+
+	spin_lock(&md_mm_ctx_table_lock);
+	active = md_active_mm_lookup_locked(mm) != NULL;
+	spin_unlock(&md_mm_ctx_table_lock);
+
+	return active;
 }
 
 /*
@@ -285,8 +409,14 @@ static bool md_fault_addr_allowed(const struct vm_area_struct *vma,
 	if (!wrap)
 		return true;
 
+	/*
+	 * The wrapped shmem VMA starts at the SharedArena header page, while
+	 * wrap->arena_base points at the ownership-tracked data area after that
+	 * header. The header contains shared userspace allocator metadata and is
+	 * intentionally outside page_slot[] protection.
+	 */
 	if (address < wrap->arena_base)
-		return false;
+		return true;
 
 	offset = address - wrap->arena_base;
 	page_idx = offset >> PAGE_SHIFT;
@@ -653,6 +783,7 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 		owner_gen = arena->owner_table[slot].gen;
 		for (i = start; i < end; i++) {
 			arena->page_slot[i] = (u8)slot;
+			arena->page_free[i] = 0;
 			arena->page_owner_gen[i] = owner_gen;
 		}
 		arena->owner_table[slot].ref_pages += end - start;
@@ -670,6 +801,13 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 			u16 slot = arena->page_slot[i];
 
 			arena->page_slot[i] = MD_INVALID_SLOT;
+			/*
+			 * Only the first page of a freed block contains the
+			 * intrusive freelist header.  Prefault that metadata page
+			 * so future retrieve()/merge operations can inspect it,
+			 * but keep the rest of the free run demand-faulted.
+			 */
+			arena->page_free[i] = (i == start);
 			arena->page_owner_gen[i] = 0;
 			if (slot < arena->owner_slots &&
 			    arena->owner_table[slot].ref_pages)
@@ -1011,6 +1149,8 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 		ret = md_install_vma_ops(current->mm, cpu, arena_base, arena->nr_pages);
 		mmap_write_unlock(current->mm);
 	}
+	if (!ret)
+		ret = md_mm_ctx_activate(ctx, GFP_KERNEL);
 out_put_ctx:
 	md_mm_ctx_put(ctx);
 	return ret;
@@ -1042,21 +1182,33 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 					 struct task_struct *next)
 {
 	unsigned int cpu;
+	bool prev_active = prev && prev->mm && md_mm_has_active_ctx(prev->mm);
+	bool next_active = next && next->mm && md_mm_has_active_ctx(next->mm);
 
-	/* Fast path: no arena registered system-wide, skip all locking. */
-	if (!atomic_read(&md_active_arenas))
+	/* Fast path: neither switched mm participates in memory delegation. */
+	if (!prev_active && !next_active)
 		return;
 
 	cpu = smp_processor_id();
 
-	if (prev && prev->mm) {
-		struct md_mm_ctx *prev_ctx;
-		unsigned long arena_base;
+	if (prev_active) {
+		unsigned int ring_cpu;
 
-		prev_ctx = md_mm_ctx_lookup_get(prev->mm, cpu);
-		if (prev_ctx) {
+		/*
+		 * A thread may free memory from arena N while currently running
+		 * on CPU M after migration.  The log is appended to arena N's
+		 * per-(mm,N) ring, so draining only CPU M can leave ownership
+		 * stale indefinitely if this mm no longer runs on CPU N.
+		 */
+		for_each_possible_cpu(ring_cpu) {
+			struct md_mm_ctx *prev_ctx;
+			unsigned long arena_base;
+
+			prev_ctx = md_mm_ctx_lookup_get(prev->mm, ring_cpu);
+			if (!prev_ctx)
+				continue;
+
 			arena_base = READ_ONCE(prev_ctx->arena_base);
-
 			if (arena_base)
 				md_drain_log_ring(prev_ctx);
 
@@ -1064,7 +1216,7 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 		}
 	}
 
-	if (!next || !next->mm)
+	if (!next_active)
 		return;
 
 	{
@@ -1091,7 +1243,7 @@ EXPORT_SYMBOL_GPL(memory_delegation_on_context_switch);
 */
 static int md_snapshot_chunk_state(struct mm_struct *mm, unsigned int cpu,
 				   u32 chunk, u64 last_seen, bool accessible[],
-				   bool free_pages[],
+				   bool prefault_pages[],
 				   u32 *out_start_page, u32 *out_end_page)
 {
 	struct md_arena_meta *arena;
@@ -1123,8 +1275,9 @@ static int md_snapshot_chunk_state(struct mm_struct *mm, unsigned int cpu,
 		return 1;
 	}
 	for (page = start_page; page < end_page; page++) {
-		free_pages[page - start_page] =
-			arena->page_slot[page] == MD_INVALID_SLOT;
+		prefault_pages[page - start_page] =
+			arena->page_slot[page] == MD_INVALID_SLOT &&
+			arena->page_free[page];
 		accessible[page - start_page] =
 			md_page_accessible_to_mm_locked(arena, page, mm);
 	}
@@ -1149,7 +1302,7 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 	u32 nr_chunks;
 	u32 chunk;
 	bool accessible[MD_CHUNK_PAGES];
-	bool free_pages[MD_CHUNK_PAGES];
+	bool prefault_pages[MD_CHUNK_PAGES];
 	int ret = 0;
 
 	if (!mm || cpu >= nr_cpu_ids || !arena_base)
@@ -1190,7 +1343,7 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 		int snap_ret;
 
 		snap_ret = md_snapshot_chunk_state(mm, cpu, chunk, last_seen,
-						   accessible, free_pages,
+						   accessible, prefault_pages,
 						   &start_page, &end_page);
 		if (snap_ret == 1)
 			continue;
@@ -1217,13 +1370,13 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 				in_run = false;
 			}
 
-			// in_free_run表示正在处理一个空闲页面的连续段
-			if (free_pages[page - start_page] && !in_free_run) {
+			// in_free_run表示正在处理一个释放后进入freelist的连续段
+			if (prefault_pages[page - start_page] && !in_free_run) {
 				in_free_run = true;
 				free_run_start = page;
 				continue;
 			}
-			if (!free_pages[page - start_page] && in_free_run) {
+			if (!prefault_pages[page - start_page] && in_free_run) {
 				unsigned long start = arena_base +
 					(unsigned long)free_run_start * PAGE_SIZE;
 				unsigned long end = arena_base +
@@ -1279,10 +1432,12 @@ int memory_delegation_fork_mm(struct task_struct *task, struct mm_struct *new_mm
 	if (!task || !new_mm || !old_mm)
 		return -EINVAL;
 
+	if (!md_mm_has_active_ctx(old_mm))
+		return 0;
+
 	for_each_possible_cpu(cpu) {
 		struct md_mm_ctx *old_ctx;
 		struct md_mm_ctx *new_ctx;
-		struct md_arena_meta *arena;
 		unsigned long arena_base;
 
 		old_ctx = md_mm_ctx_lookup_get(old_mm, cpu);
@@ -1308,13 +1463,6 @@ int memory_delegation_fork_mm(struct task_struct *task, struct mm_struct *new_mm
 		spin_lock(&new_ctx->lock);
 		new_ctx->last_seen_gen = 0;
 		spin_unlock(&new_ctx->lock);
-
-		rcu_read_lock();
-		arena = md_get_arena_rcu(cpu);
-		if (arena)
-			md_queue_sync_if_needed(new_ctx, task,
-					READ_ONCE(arena->global_commit_seq));
-		rcu_read_unlock();
 		md_mm_ctx_put(new_ctx);
 	}
 
@@ -1330,6 +1478,9 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 	struct hlist_node *tmp;
 
 	if (!mm)
+		return;
+
+	if (!md_mm_has_active_ctx(mm))
 		return;
 
 	for_each_possible_cpu(cpu) {
@@ -1368,6 +1519,7 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 
 			slot = arena->page_slot[page];
 			arena->page_slot[page] = MD_INVALID_SLOT;
+			arena->page_free[page] = 0;
 			arena->page_owner_gen[page] = 0;
 			if (slot < arena->owner_slots &&
 			    arena->owner_table[slot].ref_pages)
@@ -1388,6 +1540,10 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 			continue;
 		hash_del(&ctx->node);
 		ctx->dead = true;
+		if (ctx->active) {
+			ctx->active = false;
+			md_active_mm_put_locked(mm);
+		}
 		md_mm_ctx_put(ctx);
 	}
 	spin_unlock(&md_mm_ctx_table_lock);
@@ -1407,8 +1563,8 @@ bool memory_delegation_fault_allowed(struct mm_struct *mm,
 	if (md_vma_is_wrapped(vma))
 		return true;
 
-	/* Fast path: no arena registered system-wide, skip all locking. */
-	if (!atomic_read(&md_active_arenas))
+	/* Fast path: this mm never registered a delegation context. */
+	if (!md_mm_has_active_ctx(mm))
 		return true;
 
 	for_each_possible_cpu(cpu) {

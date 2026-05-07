@@ -64,6 +64,19 @@ static void install_alarm(int seconds) {
   alarm((unsigned)seconds);
 }
 
+static long env_long(const char *name, long fallback) {
+  const char *value = getenv(name);
+  if (!value || value[0] == '\0')
+    return fallback;
+
+  char *end = nullptr;
+  long parsed = strtol(value, &end, 10);
+  if (!end || *end != '\0')
+    die("invalid %s=%s", name, value);
+
+  return parsed;
+}
+
 static void yield_many(int n) {
   for (int i = 0; i < n; i++) {
     sched_yield();
@@ -74,12 +87,42 @@ static void yield_many(int n) {
   }
 }
 
-static void pin_to_cpu0(void) {
+static int g_test_cpu = 0;
+static int g_free_cpu = -1;
+
+static void init_test_cpu(void) {
+  const char *cpu = getenv("SCUDO_SHARED_ARENA_TEST_CPU");
+  const char *free_cpu = getenv("SCUDO_SHARED_ARENA_TEST_FREE_CPU");
+
+  if (cpu && cpu[0] != '\0') {
+    char *end = nullptr;
+    long v = strtol(cpu, &end, 10);
+    if (!end || *end != '\0' || v < 0 || v >= CPU_SETSIZE)
+      die("invalid SCUDO_SHARED_ARENA_TEST_CPU=%s", cpu);
+
+    g_test_cpu = (int)v;
+  }
+
+  if (free_cpu && free_cpu[0] != '\0') {
+    char *end = nullptr;
+    long v = strtol(free_cpu, &end, 10);
+    if (!end || *end != '\0' || v < 0 || v >= CPU_SETSIZE)
+      die("invalid SCUDO_SHARED_ARENA_TEST_FREE_CPU=%s", free_cpu);
+
+    g_free_cpu = (int)v;
+  }
+}
+
+static void pin_to_cpu(int cpu) {
   cpu_set_t set;
   CPU_ZERO(&set);
-  CPU_SET(0, &set);
+  CPU_SET(cpu, &set);
   if (sched_setaffinity(0, sizeof(set), &set) != 0)
-    die("sched_setaffinity(cpu0) failed errno=%d", errno);
+    die("sched_setaffinity(cpu%d) failed errno=%d", cpu, errno);
+}
+
+static void pin_to_test_cpu(void) {
+  pin_to_cpu(g_test_cpu);
 }
 
 static uintptr_t arena_base(void) {
@@ -90,9 +133,10 @@ static uintptr_t arena_cap_per_core(void) {
   return (uintptr_t)scudo::kArenaCapacityPerCore;
 }
 
-static bool is_in_arena0(void *p) {
+static bool is_in_test_arena(void *p) {
   const uintptr_t v = (uintptr_t)p;
-  const uintptr_t base = arena_base();
+  const uintptr_t base = arena_base() +
+                         (uintptr_t)g_test_cpu * arena_cap_per_core();
   const uintptr_t cap = arena_cap_per_core();
   return v >= base && v < (base + cap);
 }
@@ -199,14 +243,17 @@ static void read_full(int fd, void *buf, size_t n) {
 }
 
 static void child_main(int to_child, int to_parent, int child_idx) {
-  pin_to_cpu0();
-  install_segv_handler();
-
-  // Use SharedArena API directly to guarantee fixed-VA arena allocations.
+  // Initialize before pinning: SharedArenaPool sizes itself from the current
+  // affinity mask, while the actual test operations should run on g_test_cpu.
   scudo::SharedArenaPool &Pool = scudo::SharedArenaPool::getInstance();
   Pool.init();
   if (!Pool.isReady())
     die("SharedArenaPool not ready in child");
+
+  pin_to_test_cpu();
+  install_segv_handler();
+
+  // Use SharedArena API directly to guarantee fixed-VA arena allocations.
   scudo::SharedArena *Arena = Pool.getCurrentArena();
   if (!Arena)
     die("getCurrentArena() returned null (cpu?)");
@@ -222,6 +269,7 @@ static void child_main(int to_child, int to_parent, int child_idx) {
     if (m.type == CMD_EXIT) {
       _exit(0);
     } else if (m.type == CMD_ALLOC) {
+      pin_to_test_cpu();
       const size_t sz = (size_t)m.arg0;
       const uintptr_t Align = (uintptr_t)sysconf(_SC_PAGESIZE);
 
@@ -265,12 +313,27 @@ static void child_main(int to_child, int to_parent, int child_idx) {
     } else if (m.type == CMD_FREE) {
       if (!owned)
         die("CMD_FREE with no owned allocation");
-      if (!Arena->store((scudo::uptr)(uintptr_t)owned,
-                        (scudo::uptr)owned_commit_size))
+      if (g_free_cpu >= 0) {
+        fprintf(stderr,
+                "child=%d pid=%d: migrate_to_free_cpu cpu=%d before store\n",
+                child_idx, getpid(), g_free_cpu);
+        pin_to_cpu(g_free_cpu);
+        yield_many(20);
+      }
+      scudo::SharedArena *OwnerArena =
+          Pool.getOwningArena((scudo::uptr)(uintptr_t)owned);
+      if (!OwnerArena)
+        die("getOwningArena(%p) returned null", owned);
+      if (!OwnerArena->store((scudo::uptr)(uintptr_t)owned,
+                             (scudo::uptr)owned_commit_size))
         die("Arena->store failed");
       owned = NULL;
       owned_commit_size = 0;
       yield_many(80);
+      if (g_free_cpu >= 0) {
+        pin_to_test_cpu();
+        yield_many(20);
+      }
       uint64_t ok = 1;
       write_full(to_parent, &ok, sizeof(ok));
     } else if (m.type == CMD_TOUCH_EXPECT_SEGV) {
@@ -293,18 +356,24 @@ int main(void) {
   // Hard timeout: avoid hanging QEMU runs.
   install_alarm(40);
 
-  pin_to_cpu0();
+  init_test_cpu();
+  fprintf(stderr, "scudo_shared_arena_test: target_cpu=%d free_cpu=%d\n",
+          g_test_cpu, g_free_cpu);
 
   // Make the test robust even if env-cache initialization happens before main().
   // This forces SharedArenaPool::shouldUseArena() to return true.
   scudo::setSharedArenaForceForTesting(true);
+  scudo::SharedArenaPool &Pool = scudo::SharedArenaPool::getInstance();
+  Pool.init();
+  if (!Pool.isReady())
+    die("SharedArenaPool not ready in parent");
+
+  pin_to_test_cpu();
 
   // Debug mode: only initialize the pool and exit, to validate kernel/userspace
   // wiring on a physical device without stressing revoke/fault paths.
   const char *mode = getenv("SCUDO_SHARED_ARENA_TEST_MODE");
   if (mode && mode[0] != '\0' && strcmp(mode, "init_only") == 0) {
-    scudo::SharedArenaPool &Pool = scudo::SharedArenaPool::getInstance();
-    Pool.init();
     fprintf(stderr, "MODE(init_only): pool_ready=%d\n", Pool.isReady() ? 1 : 0);
     return Pool.isReady() ? 0 : 1;
   }
@@ -312,16 +381,28 @@ int main(void) {
   // Warm-up: populate free list in SharedArena (best-effort).
   // Use large allocations to force the Secondary allocator (SharedArena is in
   // secondary.h). Keep it below per-core arena capacity.
-  const size_t warm_iters = 8;
-  for (size_t i = 0; i < warm_iters; i++) {
-    const size_t sz = (32U << 20) + (i % 8) * (1U << 20); // 32MB .. 39MB
-    void *p = malloc(sz);
-    if (!p)
-      die("warmup malloc failed at iter=%zu", i);
-    touch_rw(p, sz);
-    free(p);
-    if ((i & 63u) == 0u)
-      yield_many(2);
+  size_t warm_iters = 8;
+  const long warm_iters_env =
+      env_long("SCUDO_SHARED_ARENA_TEST_WARM_ITERS", (long)warm_iters);
+  if (warm_iters_env < 0)
+    die("invalid SCUDO_SHARED_ARENA_TEST_WARM_ITERS=%ld", warm_iters_env);
+  warm_iters = (size_t)warm_iters_env;
+
+  const long skip_warmup =
+      env_long("SCUDO_SHARED_ARENA_TEST_SKIP_WARMUP", 0);
+  if (!skip_warmup) {
+    for (size_t i = 0; i < warm_iters; i++) {
+      const size_t sz = (32U << 20) + (i % 8) * (1U << 20); // 32MB .. 39MB
+      void *p = malloc(sz);
+      if (!p)
+        die("warmup malloc failed at iter=%zu", i);
+      touch_rw(p, sz);
+      free(p);
+      if ((i & 63u) == 0u)
+        yield_many(2);
+    }
+  } else {
+    fprintf(stderr, "TEST_CFG: skip warmup\n");
   }
   yield_many(100);
 
@@ -372,7 +453,7 @@ int main(void) {
   {
     const char *mr = getenv("SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS");
     if (mr && mr[0] != '\0') {
-      long v = strtol(mr, nullptr, 10);
+      long v = env_long("SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS", 0);
       if (v > 0)
         max_rounds = (v < (long)N * 2) ? (int)v : (N * 2);
       fprintf(stderr,
@@ -397,12 +478,13 @@ int main(void) {
     fprintf(stderr, "round=%d owner=%d: alloc resp addr=%p sz=%zu\n",
             round, owner, addr, sz);
 
-    if (!is_in_arena0(addr)) {
-      const uintptr_t base = arena_base();
+    if (!is_in_test_arena(addr)) {
+      const uintptr_t base = arena_base() +
+                             (uintptr_t)g_test_cpu * arena_cap_per_core();
       const uintptr_t cap = arena_cap_per_core();
-      die("allocation VA %p not in expected shared arena range [0x%016" PRIxPTR
+      die("allocation VA %p not in expected cpu%d shared arena range [0x%016" PRIxPTR
           ", 0x%016" PRIxPTR ")",
-          addr, base, base + cap);
+          addr, g_test_cpu, base, base + cap);
     }
 
     if ((uintptr_t)addr == last_addr)
@@ -465,4 +547,3 @@ int main(void) {
   fprintf(stderr, "PASS(scudo): shared arena retrieve/store ok\n");
   return 0;
 }
-

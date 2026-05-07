@@ -60,12 +60,24 @@ KERNEL_IMAGE="${KERNEL_IMAGE}" INITRAMFS="${INITRAMFS}" \
   "${SCRIPT_DIR}/qemu_run_aarch64.sh"
 
 echo "== Check results =="
-grep -Fq "PASS(scudo): shared arena retrieve/store ok" "${LOG}" || {
-  echo "FAIL: scudo_shared_arena_test PASS marker missing" >&2
-  tail -n 120 "${LOG}" >&2 || true
+if grep -Eq "Kernel panic|FAIL\\(scudo\\)" "${LOG}"; then
+  echo "FAIL: QEMU log contains kernel panic or scudo failure" >&2
+  tail -n 160 "${LOG}" >&2 || true
+  exit 1
+fi
+
+grep -Fq "Running scudo_shared_arena_test on CPU 1" "${LOG}" || {
+  echo "FAIL: CPU1 test run marker missing" >&2
+  tail -n 160 "${LOG}" >&2 || true
   exit 1
 }
-echo "PASS: scudo_shared_arena_test succeeded under QEMU"
+
+pass_count="$(grep -Fc "PASS(scudo): shared arena retrieve/store ok" "${LOG}")"
+if [[ "${pass_count}" -lt 2 ]]; then
+  echo "FAIL: scudo_shared_arena_test PASS marker missing" >&2
+  tail -n 160 "${LOG}" >&2 || true
+  exit 1
+fi
+echo "PASS: scudo_shared_arena_test succeeded under QEMU (${pass_count} runs)"
 
 echo "Log: ${LOG}"
-

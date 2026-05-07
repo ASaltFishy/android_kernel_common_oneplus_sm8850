@@ -25,6 +25,9 @@ desc="$(file -b "${BUSYBOX}" || true)"
 echo "${desc}" | grep -qiE 'aarch64|ARM aarch64' || { echo "BUSYBOX is not aarch64: ${desc}" >&2; exit 1; }
 
 AUTO_EXIT="${AUTO_EXIT:-0}"
+QEMU_TEST_CPUS="${SCUDO_SHARED_ARENA_TEST_CPUS:-0 1}"
+QEMU_CROSS_FREE_CPU="${SCUDO_SHARED_ARENA_TEST_CROSS_FREE_CPU:-1}"
+QEMU_CROSS_FREE_ROUNDS="${SCUDO_SHARED_ARENA_TEST_CROSS_FREE_ROUNDS:-4}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -53,7 +56,17 @@ if [ -x /bin/scudo_shared_arena_test ]; then
   # Must be set before allocator initialization (can happen before main()).
   export SCUDO_SHARED_ARENA_FORCE=1
   export SCUDO_SHARED_ARENA_TRACE=1
-  /bin/scudo_shared_arena_test || echo "scudo_shared_arena_test failed (see output above)"
+  for cpu in ${QEMU_TEST_CPUS}; do
+    echo "Running scudo_shared_arena_test on CPU \${cpu} ..."
+    SCUDO_SHARED_ARENA_TEST_CPU="\${cpu}" /bin/scudo_shared_arena_test
+  done
+  if [ -n "${QEMU_CROSS_FREE_CPU}" ]; then
+    echo "Running scudo_shared_arena_test cross-free CPU 0 -> ${QEMU_CROSS_FREE_CPU} ..."
+    SCUDO_SHARED_ARENA_TEST_CPU=0 \
+    SCUDO_SHARED_ARENA_TEST_FREE_CPU="${QEMU_CROSS_FREE_CPU}" \
+    SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS="${QEMU_CROSS_FREE_ROUNDS}" \
+      /bin/scudo_shared_arena_test
+  fi
   echo
 fi
 if [ "${AUTO_EXIT}" = "1" ]; then
@@ -74,4 +87,3 @@ chmod +x "${WORK}/init"
 )
 
 echo "Wrote ${OUT}"
-
