@@ -22,6 +22,7 @@
 #endif
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/task_work.h>
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 #include <linux/timex.h>
@@ -1578,6 +1579,20 @@ static void md_mark_dirty_chunks(unsigned long *dirty_chunks, u32 start, u32 end
 		   md_chunk_of_page(end - 1) - md_chunk_of_page(start) + 1);
 }
 
+/* 功能：检查 u32 页元数据范围是否全部等于 value；调用时机：free log 连续同 owner 快路径验证。 */
+static bool md_u32_range_all_equal(const u32 *array, u32 start, u32 end,
+				   u32 value)
+{
+	u32 i;
+
+	for (i = start; i < end; i++) {
+		if (array[i] != value)
+			return false;
+	}
+
+	return true;
+}
+
 /* 功能：在 arena 锁保护下把一条 shadow log 应用到页面所有权元数据；调用时机：context switch drain ring 时调用。 */
 static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 				     const struct md_shadow_log *entry,
@@ -1602,6 +1617,8 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 	if (entry->op == MD_LOG_ALLOC) {
 		u16 slot;
 		u32 owner_gen;
+		u32 nr_pages = end - start;
+		u8 prefault = (entry->flags & MD_LOG_F_PREFAULT) != 0;
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 		u64 phase_start = 0;
 		u64 phase_delta;
@@ -1610,21 +1627,18 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 			phase_start = md_read_cycles();
 #endif
 
-		for (i = start; i < end; i++) {
-			if (arena->page_slot[i] != MD_INVALID_SLOT) {
+		if (memchr_inv(arena->page_slot + start, MD_INVALID_SLOT,
+			       nr_pages)) {
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
-				if (stats) {
-					phase_delta = md_read_cycles() -
-						phase_start;
-					stats->drain_alloc_check_cycles +=
-						phase_delta;
-					md_stats_add_max(
-						&stats->max_drain_alloc_check_cycles,
-						phase_delta);
-				}
-#endif
-				return -EBUSY;
+			if (stats) {
+				phase_delta = md_read_cycles() - phase_start;
+				stats->drain_alloc_check_cycles += phase_delta;
+				md_stats_add_max(
+					&stats->max_drain_alloc_check_cycles,
+					phase_delta);
 			}
+#endif
+			return -EBUSY;
 		}
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 		if (stats) {
@@ -1651,14 +1665,11 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 		}
 
 		owner_gen = arena->owner_table[slot].gen;
-		for (i = start; i < end; i++) {
-			arena->page_slot[i] = (u8)slot;
-			arena->page_free[i] = 0;
-			arena->page_prefault[i] =
-				(entry->flags & MD_LOG_F_PREFAULT) != 0;
-			arena->page_owner_gen[i] = owner_gen;
-		}
-		arena->owner_table[slot].ref_pages += end - start;
+		memset(arena->page_slot + start, (u8)slot, nr_pages);
+		memset(arena->page_free + start, 0, nr_pages);
+		memset(arena->page_prefault + start, prefault, nr_pages);
+		memset32(arena->page_owner_gen + start, owner_gen, nr_pages);
+		arena->owner_table[slot].ref_pages += nr_pages;
 		md_mark_dirty_chunks(dirty_chunks, start, end);
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 		if (stats) {
@@ -1672,6 +1683,11 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 	}
 
 	if (entry->op == MD_LOG_FREE) {
+		struct md_owner_entry *owner = NULL;
+		u16 fast_slot = MD_INVALID_SLOT;
+		u32 fast_gen = 0;
+		u32 nr_pages = end - start;
+		bool fast_free = false;
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 		u64 phase_start = 0;
 		u64 phase_delta;
@@ -1679,20 +1695,38 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 		if (stats)
 			phase_start = md_read_cycles();
 #endif
-		for (i = start; i < end; i++) {
-			if (!md_page_belongs_to_mm_locked(arena, i, owner_mm)) {
+		fast_slot = arena->page_slot[start];
+		if (fast_slot != MD_INVALID_SLOT &&
+		    fast_slot < arena->owner_slots) {
+			owner = &arena->owner_table[fast_slot];
+			fast_gen = arena->page_owner_gen[start];
+			if (owner->valid && owner->mm == owner_mm &&
+			    owner->gen == fast_gen &&
+			    !memchr_inv(arena->page_slot + start,
+					(u8)fast_slot, nr_pages) &&
+			    md_u32_range_all_equal(arena->page_owner_gen,
+						   start, end, fast_gen) &&
+			    owner->ref_pages >= nr_pages)
+				fast_free = true;
+		}
+
+		if (!fast_free) {
+			for (i = start; i < end; i++) {
+				if (!md_page_belongs_to_mm_locked(arena, i,
+								  owner_mm)) {
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
-				if (stats) {
-					phase_delta = md_read_cycles() -
-						phase_start;
-					stats->drain_free_check_cycles +=
-						phase_delta;
-					md_stats_add_max(
-						&stats->max_drain_free_check_cycles,
-						phase_delta);
-				}
+					if (stats) {
+						phase_delta = md_read_cycles() -
+							phase_start;
+						stats->drain_free_check_cycles +=
+							phase_delta;
+						md_stats_add_max(
+							&stats->max_drain_free_check_cycles,
+							phase_delta);
+					}
 #endif
-				return -EPERM;
+					return -EPERM;
+				}
 			}
 		}
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
@@ -1705,23 +1739,40 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 		}
 #endif
 
-		for (i = start; i < end; i++) {
-			u16 slot = arena->page_slot[i];
-
-			arena->page_slot[i] = MD_INVALID_SLOT;
+		if (fast_free) {
+			memset(arena->page_slot + start, MD_INVALID_SLOT,
+			       nr_pages);
+			memset(arena->page_free + start, 0, nr_pages);
 			/*
 			 * Only the first page of a freed block contains the
 			 * intrusive freelist header.  Prefault that metadata page
 			 * so future retrieve()/merge operations can inspect it,
 			 * but keep the rest of the free run demand-faulted.
 			 */
-			arena->page_free[i] = (i == start);
-			arena->page_prefault[i] = 0;
-			arena->page_owner_gen[i] = 0;
-			if (slot < arena->owner_slots &&
-			    arena->owner_table[slot].ref_pages)
-				arena->owner_table[slot].ref_pages--;
-			md_put_owner_slot_locked(arena, slot);
+			arena->page_free[start] = 1;
+			memset(arena->page_prefault + start, 0, nr_pages);
+			memset32(arena->page_owner_gen + start, 0, nr_pages);
+			owner->ref_pages -= nr_pages;
+			md_put_owner_slot_locked(arena, fast_slot);
+		} else {
+			for (i = start; i < end; i++) {
+				u16 slot = arena->page_slot[i];
+
+				arena->page_slot[i] = MD_INVALID_SLOT;
+				/*
+				 * Only the first page of a freed block contains the
+				 * intrusive freelist header.  Prefault that metadata page
+				 * so future retrieve()/merge operations can inspect it,
+				 * but keep the rest of the free run demand-faulted.
+				 */
+				arena->page_free[i] = (i == start);
+				arena->page_prefault[i] = 0;
+				arena->page_owner_gen[i] = 0;
+				if (slot < arena->owner_slots &&
+				    arena->owner_table[slot].ref_pages)
+					arena->owner_table[slot].ref_pages--;
+				md_put_owner_slot_locked(arena, slot);
+			}
 		}
 		md_mark_dirty_chunks(dirty_chunks, start, end);
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
@@ -1820,6 +1871,8 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 	void *kaddr;
 	u32 head, tail, i;
 	unsigned long src_cpu;
+	u8 first_src_cpu = U8_MAX;
+	bool single_src_batch = true;
 	bool had_entries = false;
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 	u64 scan_start = 0;
@@ -1875,9 +1928,19 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 	for (i = head; i != tail; i++) {
 		u8 src = entries[i % ring->capacity].src_cpu;
 
-		if (src < nr_cpu_ids)
-			__set_bit(src, src_cpus);
+		if (src >= nr_cpu_ids) {
+			single_src_batch = false;
+			continue;
+		}
+
+		__set_bit(src, src_cpus);
+		if (first_src_cpu == U8_MAX)
+			first_src_cpu = src;
+		else if (src != first_src_cpu)
+			single_src_batch = false;
 	}
+	if (first_src_cpu == U8_MAX)
+		single_src_batch = false;
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 	if (stats) {
 		scan_delta = md_read_cycles() - scan_start;
@@ -1893,6 +1956,7 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 	 */
 	for_each_set_bit(src_cpu, src_cpus, NR_CPUS) {
 		struct md_arena_meta *arena;
+		bool filter_src = !single_src_batch;
 
 		bitmap_zero(dirty_chunks,
 			    DIV_ROUND_UP(MD_SHARED_ARENA_NR_PAGES, MD_CHUNK_PAGES));
@@ -1925,7 +1989,7 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 				u64 apply_delta;
 				int ret;
 
-				if (entry->src_cpu != (u8)src_cpu)
+				if (filter_src && entry->src_cpu != (u8)src_cpu)
 					continue;
 
 				apply_start = md_read_cycles();
@@ -1990,7 +2054,7 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 				&entries[i % ring->capacity];
 			int ret;
 
-			if (entry->src_cpu != (u8)src_cpu)
+			if (filter_src && entry->src_cpu != (u8)src_cpu)
 				continue;
 
 			ret = md_apply_log_entry_locked(arena, entry,
