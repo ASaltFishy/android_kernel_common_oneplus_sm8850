@@ -72,6 +72,30 @@ grep -Fq "Running scudo_shared_arena_test on CPU 1" "${LOG}" || {
   exit 1
 }
 
+grep -Fq "PASS(scudo): shared arena single-process malloc/free ok" "${LOG}" || {
+  echo "FAIL: single-process Scudo malloc/free PASS marker missing" >&2
+  tail -n 160 "${LOG}" >&2 || true
+  exit 1
+}
+
+grep -Fq "PASS(scudo): shared arena pressure toggle ok" "${LOG}" || {
+  echo "FAIL: pressure-toggle Scudo PASS marker missing" >&2
+  tail -n 160 "${LOG}" >&2 || true
+  exit 1
+}
+
+grep -Fq "PASS(scudo): shared arena multi-thread malloc/free ok" "${LOG}" || {
+  echo "FAIL: multi-thread Scudo malloc/free PASS marker missing" >&2
+  tail -n 160 "${LOG}" >&2 || true
+  exit 1
+}
+
+grep -Fq "PASS(scudo): shared arena lifecycle split/exit ok" "${LOG}" || {
+  echo "FAIL: lifecycle split/exit PASS marker missing" >&2
+  tail -n 160 "${LOG}" >&2 || true
+  exit 1
+}
+
 pass_count="$(grep -Fc "PASS(scudo): shared arena retrieve/store ok" "${LOG}")"
 if [[ "${pass_count}" -lt 2 ]]; then
   echo "FAIL: scudo_shared_arena_test PASS marker missing" >&2

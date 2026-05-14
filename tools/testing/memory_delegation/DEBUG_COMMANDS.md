@@ -65,7 +65,7 @@ tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
 常用变量：
 
 ```bash
-JUMP_HOST=lrc@192.168.60.221
+JUMP_HOST=lrc@192.168.61.4
 ADB_BIN=/opt/homebrew/bin/adb
 ADB_SERIAL=3B15AL00K5D00000
 PHONE_DIR=/data/local/tmp/md
@@ -113,28 +113,28 @@ SCUDO_SHARED_ARENA_FORCE=1 SCUDO_SHARED_ARENA_TRACE=1
 通过 macOS 跳板机检查设备：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.60.221 \
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb devices -l"
 ```
 
 等待手机重新上线：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.60.221 \
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb wait-for-device"
 ```
 
 直接在手机上运行已 push 的测试二进制：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.60.221 \
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb shell 'cd /data/local/tmp/md && SCUDO_SHARED_ARENA_FORCE=1 SCUDO_SHARED_ARENA_TRACE=1 SCUDO_SHARED_ARENA_TEST_CPU=0 ./scudo_shared_arena_test'"
 ```
 
 抓 logcat：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.60.221 \
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb logcat -d -v time | tail -n 400"
 ```
 
@@ -147,9 +147,125 @@ USE_SU=1 tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
 或手动：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.60.221 \
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb shell \"su 0 -c 'dmesg | tail -n 400'\""
 ```
+
+### 4.1 内核上下文切换 cycle 统计
+
+当前内核在 `CONFIG_MEMORY_DELEGATION_DEBUGFS` 下提供 memory delegation
+调度路径的 cycle 统计入口。该配置依赖 `CONFIG_DEBUG_FS`：
+
+```text
+/sys/kernel/debug/memory_delegation/switch_cycle_stats
+/sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+```
+
+该统计使用 ARM64 `get_cycles()`，也就是 generic timer `cntvct` counter。
+它适合在同一台机器上做相对比较；注意它不一定等同于 CPU core PMU
+cycle。
+
+确认 debugfs 文件存在：
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
+   'su 0 -c \"mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
+             head -n 4 /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
+```
+
+跑 `scudo_shared_arena_test` 并统计包含 PTE sync 的内核增量路径：
+
+```bash
+OUT=/tmp/md-switch-pte-cycle-stats-$(date +%Y%m%d-%H%M%S).txt
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
+   'su 0 -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+             echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled\"; \
+    cd /data/local/tmp/md && \
+    SCUDO_SHARED_ARENA_FORCE=1 \
+    SCUDO_SHARED_ARENA_TRACE=0 \
+    SCUDO_SHARED_ARENA_TEST_CPU=0 \
+    SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=20 \
+    ./scudo_shared_arena_test >/data/local/tmp/md/switch_pte_cycle_test.out 2>&1; \
+    rc=\$?; \
+    cat /data/local/tmp/md/switch_pte_cycle_test.out; \
+    su 0 -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
+              cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
+    exit \$rc'" | tee "${OUT}"
+echo "saved: ${OUT}"
+```
+
+也可以手动开关：
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  "/opt/homebrew/bin/adb shell \
+   'su 0 -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+             echo enable > /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
+
+# ...运行 workload...
+
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  "/opt/homebrew/bin/adb shell \
+   'su 0 -c \"echo disable > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+             cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
+```
+
+输出列说明：
+
+- `calls`：进入 `memory_delegation_on_context_switch()` 的次数
+- `fast`：prev/next 都没有 active memory delegation ctx 的快速返回次数
+- `active`：prev 或 next 有 active memory delegation ctx 的次数
+- `prev_active` / `next_active`：switch-out prev / switch-in next 参与 delegation 的次数
+- `drain`：检查并调用 `md_drain_log_ring()` 的次数，包含空 ring
+- `drain_nonempty`：真正有 log entry 被 drain 的次数
+- `syncq`：switch-in 阶段检查/尝试 queue PTE sync task_work 的次数
+- `pte_sync`：实际执行 `md_sync_task_work()` 并调用 `memory_delegation_sync_mm()` 的次数
+- `avg_active`：delegation hook 活跃路径的平均开销
+- `avg_drain_nonempty`：非空 log ring drain 的平均开销
+- `avg_pte_sync`：实际 PTE unmap/prefault 同步的平均开销
+- `avg_queue_to_sync_done`：从 context switch 中成功 queue task_work 到 PTE sync 完成的平均跨度
+
+最近一次真机参考结果：
+
+```text
+/tmp/md-switch-pte-cycle-stats-20260508-100102.txt
+
+total:
+calls=13811
+active=7041
+prev_active=4302
+next_active=4302
+drain=34401
+drain_nonempty=18
+syncq=4299
+pte_sync=76
+
+avg_active=63 cycles
+avg_drain=9 cycles
+avg_drain_nonempty=10879 cycles
+avg_syncq=2 cycles
+avg_pte_sync=3550 cycles
+avg_queue_to_sync_done=3876 cycles
+
+max_total=60655 cycles
+max_drain=60633 cycles
+max_pte_sync=9463 cycles
+max_queue_to_sync_done=14537 cycles
+```
+
+若关心“有非空 log drain，并且 next 返回用户态前完成 PTE sync”的
+memory delegation 额外内核路径，可粗略看：
+
+```text
+avg_drain_nonempty + avg_queue_to_sync_done
+= 10879 + 3876
+= 14755 cycles
+```
+
+注意：这不是完整 Linux `context_switch()` 或 syscall/yield 从进内核到出内核
+的总耗时；它只覆盖 memory delegation 相关增量路径。
 
 ## 5. 手机测试输出位置
 
@@ -371,11 +487,11 @@ child pipe EOF：
 
 - 重新等待设备上线：
   ```bash
-  ssh lrc@192.168.60.221 "/opt/homebrew/bin/adb wait-for-device"
+  ssh lrc@192.168.61.4 "/opt/homebrew/bin/adb wait-for-device"
   ```
 - 检查启动原因和 pstore：
   ```bash
-  ssh lrc@192.168.60.221 \
+  ssh lrc@192.168.61.4 \
     '/opt/homebrew/bin/adb shell getprop sys.boot.reason; \
      /opt/homebrew/bin/adb shell getprop ro.boot.bootreason; \
      /opt/homebrew/bin/adb shell su 0 -c "ls -la /sys/fs/pstore"'

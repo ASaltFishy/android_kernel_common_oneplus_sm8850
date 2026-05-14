@@ -4,6 +4,7 @@
 #
 # Outputs:
 #   out/scudo_shared_arena_test
+#   out/scudo_shared_arena_latency_bench
 #
 
 OUT_DIR := $(CURDIR)/out
@@ -33,11 +34,11 @@ SCUDO_PLATFORM_DEFS := -DSCUDO_LINUX=1 -DSCUDO_ANDROID=0
 LDFLAGS_EXTRA :=
 endif
 
-CXXFLAGS_COMMON := $(CFLAGS_COMMON) -fno-exceptions -fno-rtti
+CXXFLAGS_COMMON := $(CFLAGS_COMMON) -std=c++17 -fno-exceptions -fno-rtti
 
-.PHONY: all clean scudo_shared_arena_test print-vars
+.PHONY: all clean scudo_shared_arena_test scudo_shared_arena_latency_bench print-vars
 
-all: scudo_shared_arena_test
+all: scudo_shared_arena_test scudo_shared_arena_latency_bench
 
 print-vars:
 	@echo "OUT_DIR=$(OUT_DIR)"
@@ -54,16 +55,49 @@ $(OUT_DIR):
 
 
 scudo_shared_arena_test: $(OUT_DIR)/scudo_shared_arena_test
+scudo_shared_arena_latency_bench: $(OUT_DIR)/scudo_shared_arena_latency_bench
 
-# Minimal Scudo source set needed by SharedArena on Linux.
+# Scudo standalone allocator + C wrappers.  Keep this source list aligned with
+# standalone/CMakeLists.txt so malloc/free in the smoke binary are Scudo's
+# wrappers, not glibc malloc/free.
 SCUDO_SRC := \
+	$(SCUDO_DIR)/checksum.cpp \
 	$(SCUDO_DIR)/common.cpp \
-	$(SCUDO_DIR)/string_utils.cpp \
+	$(SCUDO_DIR)/condition_variable_linux.cpp \
+	$(SCUDO_DIR)/crc32_hw.cpp \
+	$(SCUDO_DIR)/flags_parser.cpp \
+	$(SCUDO_DIR)/flags.cpp \
+	$(SCUDO_DIR)/fuchsia.cpp \
 	$(SCUDO_DIR)/linux.cpp \
+	$(SCUDO_DIR)/mem_map.cpp \
+	$(SCUDO_DIR)/mem_map_fuchsia.cpp \
 	$(SCUDO_DIR)/mem_map_linux.cpp \
+	$(SCUDO_DIR)/release.cpp \
 	$(SCUDO_DIR)/report.cpp \
 	$(SCUDO_DIR)/report_linux.cpp \
-	$(SCUDO_DIR)/shared_arena_linux.cpp
+	$(SCUDO_DIR)/shared_arena_linux.cpp \
+	$(SCUDO_DIR)/string_utils.cpp \
+	$(SCUDO_DIR)/timing.cpp \
+	$(SCUDO_DIR)/wrappers_c.cpp
+
+SCUDO_BENCH_SRC := \
+	$(SCUDO_DIR)/checksum.cpp \
+	$(SCUDO_DIR)/common.cpp \
+	$(SCUDO_DIR)/condition_variable_linux.cpp \
+	$(SCUDO_DIR)/crc32_hw.cpp \
+	$(SCUDO_DIR)/flags_parser.cpp \
+	$(SCUDO_DIR)/flags.cpp \
+	$(SCUDO_DIR)/fuchsia.cpp \
+	$(SCUDO_DIR)/linux.cpp \
+	$(SCUDO_DIR)/mem_map.cpp \
+	$(SCUDO_DIR)/mem_map_fuchsia.cpp \
+	$(SCUDO_DIR)/mem_map_linux.cpp \
+	$(SCUDO_DIR)/release.cpp \
+	$(SCUDO_DIR)/report.cpp \
+	$(SCUDO_DIR)/report_linux.cpp \
+	$(SCUDO_DIR)/shared_arena_linux.cpp \
+	$(SCUDO_DIR)/string_utils.cpp \
+	$(SCUDO_DIR)/timing.cpp
 
 $(OUT_DIR)/scudo_shared_arena_test: \
 		$(SRC_DIR)/scudo_shared_arena_test.cpp \
@@ -79,6 +113,21 @@ $(OUT_DIR)/scudo_shared_arena_test: \
 		-o "$@" \
 		"$(SRC_DIR)/scudo_shared_arena_test.cpp" \
 		$(SCUDO_SRC) \
+		$(LDFLAGS_EXTRA)
+	@file "$@"
+
+$(OUT_DIR)/scudo_shared_arena_latency_bench: \
+		$(SCUDO_DIR)/tests/shared_arena_latency_bench.cpp \
+		$(SCUDO_BENCH_SRC) \
+		| $(OUT_DIR)
+	$(CXX) $(CXXFLAGS_COMMON) -Wno-unused-result \
+		$(SCUDO_PLATFORM_DEFS) \
+		-DSCUDO_SHARED_ARENA_BASE_ADDR=0x1000000000ULL \
+		-I"$(SCUDO_DIR)" \
+		-I"$(SCUDO_DIR)/include" \
+		-o "$@" \
+		"$(SCUDO_DIR)/tests/shared_arena_latency_bench.cpp" \
+		$(SCUDO_BENCH_SRC) \
 		$(LDFLAGS_EXTRA)
 	@file "$@"
 
