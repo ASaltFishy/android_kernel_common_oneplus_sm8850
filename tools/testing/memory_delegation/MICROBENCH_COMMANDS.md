@@ -64,6 +64,24 @@ android init mode=attach (system broker ready)
 PASS(scudo): shared arena single-process malloc/free ok
 ```
 
+### 2.0.1 Chunk size 默认配置
+
+内核侧 PTE sync 的 chunk 粒度默认使用 `MD_CHUNK_PAGES_DEFAULT=256`，
+对应 256 页，即 1 MiB。该值是基于真机 correctness workload
+（4 个子进程轮流持有 32 MiB SharedArena 块，并验证其他进程访问会被
+revoke/SIGSEGV）的 32/64/128/256/512 页参数对比后选出的当前推荐值。
+
+除非本轮实验目标就是专门做 chunk-size 调参测试，否则不要修改
+`/sys/kernel/debug/memory_delegation/chunk_pages`，也不需要在跑
+correctness suite 或 microbenchmark 前手动写这个 debugfs 节点。正常流程下，
+保持默认 256 页即可。
+
+如果确实要做 chunk-size sweep，必须在没有已注册 arena 的干净状态下写入
+`chunk_pages`。Android broker 一旦注册 arena，内核侧 `active_arenas`
+会保持非零；此时直接杀 broker/test 后再写参数会失败或不生效。真机上建议每个
+chunk 配置之间重启手机，确认 `chunk_pages` 输出中的 `active_arenas 0`
+后再写入新值并启动本轮测试。
+
 当前 microbench 需要注意三点：
 
 - Android 端通过 KernelSU 跑 root 命令，批量 bench 要使用

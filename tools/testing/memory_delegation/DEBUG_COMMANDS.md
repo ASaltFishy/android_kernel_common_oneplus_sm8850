@@ -191,6 +191,26 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
             head -n 4 /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
 ```
 
+调整 PTE sync 的 chunk 扫描粒度。默认 `MD_CHUNK_PAGES_DEFAULT=256`
+已经是当前推荐值；不专门做 chunk-size 调参测试时不要修改该值，也不需要
+手动写 `/sys/kernel/debug/memory_delegation/chunk_pages`。
+
+如果确实要调参，需没有已注册 arena / active mm。Android broker 注册 arena
+后内核侧 `active_arenas` 会保持非零，直接停掉 broker/test 通常不足以切换
+chunk 粒度；真机 sweep 建议每个配置之间重启手机，确认 `active_arenas 0`
+后再写入：
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
+   'su -c \"mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
+            for p in \$(pidof memory_delegation_broker 2>/dev/null) \$(pidof scudo_shared_arena_test 2>/dev/null); do kill -TERM \$p || true; done; \
+            sleep 1; \
+            for p in \$(pidof memory_delegation_broker 2>/dev/null) \$(pidof scudo_shared_arena_test 2>/dev/null); do kill -KILL \$p || true; done; \
+            echo 256 > /sys/kernel/debug/memory_delegation/chunk_pages; \
+            cat /sys/kernel/debug/memory_delegation/chunk_pages\"'"
+```
+
 跑 `scudo_shared_arena_test` 并统计包含 PTE sync 的内核增量路径：
 
 ```bash
@@ -210,6 +230,41 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
     su -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
             cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
     exit \$rc'" | tee "${OUT}"
+echo "saved: ${OUT}"
+```
+
+一次性比较 32/64/128/256/512 页 chunk 的 PTE sync 扫描耗时：
+
+```bash
+OUT=/tmp/md-chunk-pages-sweep-$(date +%Y%m%d-%H%M%S).txt
+for CHUNK in 32 64 128 256 512; do
+  echo "===== chunk_pages=${CHUNK} =====" | tee -a "${OUT}"
+  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+    "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
+     'su -c \"mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
+              for p in \$(pidof memory_delegation_broker 2>/dev/null) \$(pidof scudo_shared_arena_test 2>/dev/null); do kill -TERM \$p || true; done; \
+              sleep 1; \
+              for p in \$(pidof memory_delegation_broker 2>/dev/null) \$(pidof scudo_shared_arena_test 2>/dev/null); do kill -KILL \$p || true; done; \
+              echo ${CHUNK} > /sys/kernel/debug/memory_delegation/chunk_pages; \
+              cat /sys/kernel/debug/memory_delegation/chunk_pages; \
+              echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+              echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled\"; \
+      cd /data/local/tmp/md && \
+      ./memory_delegation_broker --trace >broker.log 2>&1 & \
+      broker_pid=\$!; \
+      for i in \$(seq 1 100); do grep -q \"ready num_cores=\" broker.log && break; sleep 0.1; done; \
+      SCUDO_SHARED_ARENA_FORCE=1 \
+      SCUDO_SHARED_ARENA_TRACE=0 \
+      SCUDO_SHARED_ARENA_TEST_CPU=0 \
+      SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=20 \
+      ./scudo_shared_arena_test >/data/local/tmp/md/switch_pte_cycle_test.out 2>&1; \
+      rc=\$?; \
+      cat /data/local/tmp/md/switch_pte_cycle_test.out; \
+      su -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
+              cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
+      kill \$broker_pid 2>/dev/null || true; \
+      exit \$rc'" | tee -a "${OUT}"
+done
 echo "saved: ${OUT}"
 ```
 
@@ -239,6 +294,16 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
 - `drain_nonempty`：真正有 log entry 被 drain 的次数
 - `syncq`：switch-in 阶段检查/尝试 queue PTE sync task_work 的次数
 - `pte_sync`：实际执行 `md_sync_task_work()` 并调用 `memory_delegation_sync_mm()` 的次数
+- `pte_sync_unchanged` / `pte_sync_modified`：PTE sync 中没有实际 unmap/prefault
+  修改页表的次数 / 发生实际修改的次数
+- `pte_detail_*`：PTE sync 细分统计。重点看 `avg_lock_wait`、
+  `avg_lock_hold`、`avg_scan`、`avg_snapshot`、`avg_unmap`、
+  `avg_prefault` 以及对应 `max_*`，用于判断长尾来自 mmap 写锁等待、
+  chunk 扫描/快照、zap unmap 还是 GUP prefault。
+- `dirty_chunks` / `skipped_chunks`：PTE sync 扫描中需要快照的 chunk 数 /
+  代际未变化而跳过的 chunk 数。
+- `unmap_ranges` / `unmap_pages`、`prefault_ranges` / `prefault_pages`：
+  PTE sync 实际提交给 unmap/prefault 的 range 数和页数。
 - `avg_active`：delegation hook 活跃路径的平均开销
 - `avg_drain_nonempty`：非空 log ring drain 的平均开销
 - `avg_pte_sync`：实际 PTE unmap/prefault 同步的平均开销
