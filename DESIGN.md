@@ -11,7 +11,7 @@
 
 2.1 核心架构：每核共享预映射内存池 (Per-Core Shared Arena)
 我们将原本属于单个进程的 MapAllocatorCache 升级为跨进程共享的更大 MapAllocatorPool。
-- 物理内存池化：为系统的每一个 CPU 核心维护一个全局共享的内存池（Arena）。使用每核心存储（Per-CPU Storage）保存该内存池的 head 指针。在secondary分配大页面时，直接从这个Pool中分配。初始化时，每个进程都通过shared memory接口map好arena，当系统内存压力达到一个水位线后，分配器开始放弃原本的MapAllocatorCache路径，转为直接在MapAllocatorPool上进行分配，后续物理内存通过实际访问时的page fault获得。
+- 物理内存池化：为系统的每一个 CPU 核心维护一个全局共享的内存池（Arena）。使用每核心存储（Per-CPU Storage）保存该内存池的 head 指针。在secondary分配大页面时，直接从这个Pool中分配。初始化时，每个进程都通过shared memory接口map好arena；Android 侧 shared memory backing 由常驻系统服务 `memory_delegation_broker` 创建并持有，应用进程只向 broker 获取 fd 并 attach，禁止由任意应用进程创建 memfd、抢 creator lock 或 fork 临时 broker。当系统内存压力达到一个水位线后，分配器开始放弃原本的MapAllocatorCache路径，转为直接在MapAllocatorPool上进行分配，后续物理内存通过实际访问时的page fault获得。
 - 统一虚拟地址预留：为了解决不同进程获取到的内存块在虚拟地址上不连续的问题，在每个进程的虚拟地址空间中，预先划分出一段足够大且固定大小（arena_size 作为全局常量）的连续虚拟地址区间，专门用于映射这些 Arena。实现上，先通过按需分配页面的方式创建shared memory，虚拟地址vma在此时生效，分配时走pagefault方式生成页面。
 - 缓存交接：当进程的 Secondary 分配器释放大块内存时，不再私有化成为 MapAllocatorCache，而是直接加入当前执行核心对应的 Arena 中，供其他进程借用。若 Arena 暂存的数据量超过 arena_size，则直接调用 unmap 交还给内核。
 
@@ -121,4 +121,3 @@ flowchart LR
 
 3.4 架构适配建议 (NPU DMA 内存池化)
 - (补充工程落地考量)：针对普通 DMA 映射难以“只释放其中一段连续物理页”的硬件限制，建议在系统层或 LLM 框架侧实现专属的 DMA 内存池 (DMA Memory Pool)。框架预先申请大块 DMA 内存，并在内部按层级管理 KV Cache。当内核下达回收指令时，框架配合解除局部映射，从而保证软硬件在页面粒度上的回收一致性。
-

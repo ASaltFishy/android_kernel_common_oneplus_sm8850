@@ -76,6 +76,10 @@ WAIT_SECS=120
 WAIT_BOOT_COMPLETED=1
 ```
 
+`run_phone_memory_delegation_suite.sh` 默认 `USE_SU=1`。当前测试机使用 KernelSU，
+root 命令应使用 `su -c '...'` 形式；不要写成 `su 0 -c ...` 或
+`su 0 sh -c ...`，否则可能出现清理旧 broker 失败或命令不在预期目录执行。
+
 `WAIT_BOOT_COMPLETED=1` 为默认值，runner 会等待 `sys.boot_completed=1` 后再 push/run，避免系统尚未完全启动时开始测试。
 
 示例：只跑初始化，用于确认手机链路是否可用：
@@ -106,6 +110,19 @@ runner 默认会给测试程序追加：
 
 ```bash
 SCUDO_SHARED_ARENA_FORCE=1 SCUDO_SHARED_ARENA_TRACE=1
+```
+
+Android SharedArena backing 当前由常驻 `memory_delegation_broker` 持有。
+`run_phone_over_ssh_adb.sh` 默认会先构建/上传 broker、清理旧 broker、启动新
+broker，并等待 `broker.log` 中出现 `ready num_cores=` 后再运行测试程序。
+应用进程不再创建 memfd、不再抢 creator lock、不再 fork 临时 broker。
+
+如需只验证 broker 启动链路，可手动查看手机侧日志：
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  "/opt/homebrew/bin/adb shell \"su -c 'cat /data/local/tmp/md/broker.log 2>/dev/null || true; \
+                                       ps -A | grep memory_delegation_broker || true'\""
 ```
 
 ## 4. 手机侧手动 ADB Debug
@@ -148,7 +165,7 @@ USE_SU=1 tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
 
 ```bash
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
-  "/opt/homebrew/bin/adb shell \"su 0 -c 'dmesg | tail -n 400'\""
+  "/opt/homebrew/bin/adb shell \"su -c 'dmesg | tail -n 400'\""
 ```
 
 ### 4.1 内核上下文切换 cycle 统计
@@ -170,8 +187,8 @@ cycle。
 ```bash
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
-   'su 0 -c \"mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
-             head -n 4 /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
+   'su -c \"mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
+            head -n 4 /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
 ```
 
 跑 `scudo_shared_arena_test` 并统计包含 PTE sync 的内核增量路径：
@@ -180,8 +197,8 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
 OUT=/tmp/md-switch-pte-cycle-stats-$(date +%Y%m%d-%H%M%S).txt
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
-   'su 0 -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
-             echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled\"; \
+   'su -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+            echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled\"; \
     cd /data/local/tmp/md && \
     SCUDO_SHARED_ARENA_FORCE=1 \
     SCUDO_SHARED_ARENA_TRACE=0 \
@@ -190,8 +207,8 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
     ./scudo_shared_arena_test >/data/local/tmp/md/switch_pte_cycle_test.out 2>&1; \
     rc=\$?; \
     cat /data/local/tmp/md/switch_pte_cycle_test.out; \
-    su 0 -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
-              cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
+    su -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
+            cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
     exit \$rc'" | tee "${OUT}"
 echo "saved: ${OUT}"
 ```
@@ -201,15 +218,15 @@ echo "saved: ${OUT}"
 ```bash
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb shell \
-   'su 0 -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
-             echo enable > /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
+   'su -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+            echo enable > /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
 
 # ...运行 workload...
 
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb shell \
-   'su 0 -c \"echo disable > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
-             cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
+   'su -c \"echo disable > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
+            cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"'"
 ```
 
 输出列说明：
@@ -288,6 +305,20 @@ rg -n "FAIL\\(scudo\\)|PASS\\(scudo\\)|Kernel panic|Oops|BUG:|Unable to handle|S
 
 当前手机测试已确认：
 
+- `phone-20260513-174302` / `174309` / `174316` / `174325`：完整
+  `run_phone_memory_delegation_suite.sh` 通过。命令：
+  `BUILD=0 tools/testing/memory_delegation/scripts/run_phone_memory_delegation_suite.sh`
+  （此前同轮已用 `BUILD=1 BUILD_MODE=android` 构建二进制）。覆盖：
+  - `init_only`：`android init mode=attach (system broker ready)`，
+    `PASS(scudo): shared arena single-process malloc/free ok`
+  - `single-cpu revoke/free`：`SCUDO_SHARED_ARENA_TEST_CPU=0`
+    `SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=4`，通过：
+    `PASS(scudo): shared arena malloc/free multi-proc revoke ok`，
+    `PASS(scudo): shared arena retrieve/store ok`
+  - `cross-cpu free migration`：`SCUDO_SHARED_ARENA_TEST_CPU=0`
+    `SCUDO_SHARED_ARENA_TEST_FREE_CPU=1`
+    `SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=4`，通过同上 PASS marker
+  - `short stress`：`SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=8`，通过同上 PASS marker
 - `phone-20260507-112320`：`init_only` 通过，`MODE(init_only): pool_ready=1`
 - `phone-20260507-144824`：`single-cpu revoke/free`，`SCUDO_SHARED_ARENA_TEST_CPU=0 SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=4`，通过：
   - `PASS(scudo): shared arena malloc/free multi-proc revoke ok`
@@ -298,6 +329,11 @@ rg -n "FAIL\\(scudo\\)|PASS\\(scudo\\)|Kernel panic|Oops|BUG:|Unable to handle|S
 
 历史失败记录：
 
+- `phone-20260513-173458` / `173854` / `174144`：broker 服务化 runner
+  调试阶段失败。原因分别是 shell 中 `cmd && broker & echo $! > broker.pid`
+  会让 `echo` 回到错误工作目录、以及 `su 0 ...` / `pkill -f` 在 KernelSU
+  设备上不能可靠清理旧 root broker。已修复为 `su -c`、先 `cd PHONE_DIR`
+  再后台 broker、并用 `pidof` + `kill TERM/KILL` 精确清理旧进程。
 - `phone-20260507-112523`：早期版本 `single-cpu revoke/free` 在 `round=0 owner=0` 等待 child0 allocation response 时失败，用户态报 `FAIL(scudo): read(fd=14) EOF`。后续通过 Scudo fork 后 refresh/remap arena + 重新注册 log ring 修复。
 
 ## 6. QEMU 测试入口
@@ -315,6 +351,10 @@ tools/testing/memory_delegation/scripts/run_qemu_tests.sh
 - 生成 initramfs
 - 使用 `out/Image` 启动 QEMU arm64
 - 检查 serial log 中的 PASS/FAIL/panic marker
+
+注意：QEMU 使用 `MODE=linux` 静态 ELF，SharedArena backing 走 Linux
+`shm_open`/`/dev/shm` 路径，不依赖 Android 的 `memory_delegation_broker`。
+Makefile 仍会顺手构建 broker 二进制，但 QEMU correctness suite 不会启动它。
 
 常用变量：
 
@@ -338,6 +378,22 @@ QEMU 成功标志：
 ```text
 PASS(scudo): shared arena retrieve/store ok
 PASS(scudo): shared arena malloc/free multi-proc revoke ok
+```
+
+最近一次通过记录：
+
+```text
+2026-05-13
+command: tools/testing/memory_delegation/scripts/run_qemu_tests.sh
+log: /tmp/md-qemu-run/qemu-serial.log
+result: PASS: scudo_shared_arena_test succeeded under QEMU (3 runs)
+coverage:
+- pressure_toggle
+- single_process
+- multi_thread
+- lifecycle
+- CPU 0 / CPU 1 retrieve-store
+- CPU 0 -> CPU 1 cross-free migration
 ```
 
 QEMU 失败筛查：
@@ -388,6 +444,14 @@ Android 手机二进制：
 
 ```bash
 make -C tools/testing/memory_delegation/tests MODE=android clean all
+```
+
+该命令会同时生成：
+
+```text
+tools/testing/memory_delegation/tests/out/scudo_shared_arena_test
+tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench
+tools/testing/memory_delegation/tests/out/memory_delegation_broker
 ```
 
 QEMU/Linux 静态二进制：
@@ -494,7 +558,7 @@ child pipe EOF：
   ssh lrc@192.168.61.4 \
     '/opt/homebrew/bin/adb shell getprop sys.boot.reason; \
      /opt/homebrew/bin/adb shell getprop ro.boot.bootreason; \
-     /opt/homebrew/bin/adb shell su 0 -c "ls -la /sys/fs/pstore"'
+     /opt/homebrew/bin/adb shell su -c "ls -la /sys/fs/pstore"'
   ```
 - 若临时 boot 丢失，重新刷当前 kernel；当前推荐用 flash 模式：
   ```bash

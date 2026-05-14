@@ -43,6 +43,83 @@ PASS: phone memory delegation suite completed
 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py
 ```
 
+### 2.0 Android broker / bench 前置条件
+
+Android SharedArena 依赖常驻 `memory_delegation_broker` 分发 arena backing fd。
+跑 bench 前先用 correctness runner 构建 Android 测试二进制、清理旧 broker、
+启动新 broker，并做一次 `init_only` attach smoke：
+
+```bash
+cd /home/lrc/patent/kernel/kernel_platform/common
+
+BUILD=1 BUILD_MODE=android USE_SU=1 WAIT_SECS=180 \
+EXTRA_ENV="SCUDO_SHARED_ARENA_TEST_CPU=0 SCUDO_SHARED_ARENA_TEST_MODE=init_only" \
+tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
+```
+
+成功标记：
+
+```text
+android init mode=attach (system broker ready)
+PASS(scudo): shared arena single-process malloc/free ok
+```
+
+当前 microbench 需要注意三点：
+
+- Android 端通过 KernelSU 跑 root 命令，批量 bench 要使用
+  `run_shared_arena_microbench.py --use-su`，否则非 root adb shell 可能收不到
+  broker 通过 `SCM_RIGHTS` 发送的 memfd，表现为
+  `request broker fd core=0 failed status=0 recv=8`。
+- benchmark 必须透传 `--bench-extra-args "--allocator combined"`，默认
+  `secondary_only` 不会触发 Combined allocator / SharedArena 路径。
+- benchmark 二进制要包含
+  `-DSCUDO_SHARED_ARENA_BASE_ADDR=0x1000000000ULL`。内核测试 Makefile 的
+  `MODE=android scudo_shared_arena_latency_bench` 目标已带该宏；Scudo standalone
+  的手工 NDK fallback 也应带同样宏。
+
+构建 Android bench：
+
+```bash
+cd /home/lrc/patent/kernel/kernel_platform/common
+make -C tools/testing/memory_delegation/tests MODE=android \
+  scudo_shared_arena_latency_bench memory_delegation_broker
+```
+
+输出：
+
+```text
+/home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench
+/home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/memory_delegation_broker
+```
+
+sanity：确认 root + combined 后 delegated 路径可用：
+
+```bash
+RESULTS_DIR=/home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/microbench-results/phone-kernel-scudo-sanity-su-$(date +%Y%m%d-%H%M)
+mkdir -p "${RESULTS_DIR}"
+
+python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py \
+  --remote-host lrc@192.168.61.4 \
+  --use-su \
+  --skip-build \
+  --binary /home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench \
+  --thread-counts 1 \
+  --sizes 1048576,33554432 \
+  --iterations 10 \
+  --warmup 2 \
+  --repetitions 1 \
+  --bench-extra-args "--allocator combined" \
+  --results-dir "${RESULTS_DIR}" \
+  2>&1 | tee "${RESULTS_DIR}/run.log"
+```
+
+有效输出开头应包含：
+
+```text
+SharedArena: ready=1 num_cores=8 page_size=4096
+-- delegated (SharedArena) --
+```
+
 ### 2.1 已跑通的 1/2 线程小范围测试
 
 ```bash
@@ -96,30 +173,144 @@ python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_are
 ```bash
 python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py \
   --remote-host lrc@192.168.61.4 \
+  --use-su \
+  --skip-build \
+  --binary /home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench \
   --thread-counts 1,2 \
   --sizes 16384,32768,65536,131072,262144,524288,1048576,2097152,4194304,8388608,16777216,33554432,67108864,134217728,268435456 \
   --iterations 80 \
   --warmup 20 \
   --repetitions 3 \
-  --results-dir /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/microbench-results/phone-kernel-scudo-pow2-kib-4-18-1t2t-20260507
+  --bench-extra-args "--allocator combined" \
+  --results-dir /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/microbench-results/phone-kernel-scudo-pow2-kib-4-18-1t2t-su-$(date +%Y%m%d-%H%M)
 ```
 
+### 2.3 2026-05-13 真机多轮稳定性记录
 
-如需确认 broker 没有残留：
+本轮目的：手机上跑 microbench 多轮，观察大块 delegated 路径是否还会导致
+ADB 断连/设备重启。
+
+前置 broker 启动命令：
+
+```bash
+cd /home/lrc/patent/kernel/kernel_platform/common
+
+BUILD=1 BUILD_MODE=android USE_SU=1 WAIT_SECS=180 \
+EXTRA_ENV="SCUDO_SHARED_ARENA_TEST_CPU=0 SCUDO_SHARED_ARENA_TEST_MODE=init_only" \
+tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
+```
+
+有效 sanity 结果：
+
+```text
+results: /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/microbench-results/phone-kernel-scudo-sanity-su-20260513-1810
+raw:     raw/threads01_rep01.txt
+marker:  SharedArena: ready=1 num_cores=8 page_size=4096
+marker:  -- delegated (SharedArena) --
+```
+
+正式有效多轮命令：
+
+```bash
+RESULTS_DIR=/home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/microbench-results/phone-kernel-scudo-pow2-kib-4-18-1t2t-su-3rep-20260513-1811
+mkdir -p "${RESULTS_DIR}"
+
+python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py \
+  --remote-host lrc@192.168.61.4 \
+  --use-su \
+  --skip-build \
+  --binary /home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench \
+  --thread-counts 1,2 \
+  --sizes 16384,32768,65536,131072,262144,524288,1048576,2097152,4194304,8388608,16777216,33554432,67108864,134217728,268435456 \
+  --iterations 80 \
+  --warmup 20 \
+  --repetitions 3 \
+  --bench-extra-args "--allocator combined" \
+  --results-dir "${RESULTS_DIR}" \
+  2>&1 | tee "${RESULTS_DIR}/run.log"
+```
+
+观察结果：
+
+- `threads=1, repetition=1` 完整跑完，`raw/threads01_rep01.txt` 中
+  `SharedArena: ready=1`，解析到 120 条记录。
+- 进入 `threads=2, repetition=1` 时 adb 设备消失，脚本收到 ssh/adb
+  exit 255。
+- 手机约 86 秒后重新上线，随后 `sys.boot_completed=1`。
+- `sys.boot.reason=reboot`，`ro.boot.bootreason=reboot`。
+- `/sys/fs/pstore` 为空；未抓到持久化 kernel panic/oops。
+- 重启后的 dmesg 有 vendor tracepoint WARN：
+  `tracepoint_add_func+0x228/0x438`，进程为 `autochmod.sh`，未直接指向
+  `memory_delegation`。
+- 留档：
+  - `/tmp/md-phone-microbench-reboot-20260513-1811.logcat.txt`
+  - `/tmp/md-phone-microbench-reboot-20260513-1811.dmesg.txt`
+  - `/tmp/md-phone-microbench-reboot-20260513-1811.pstore.txt`
+
+无效尝试记录：
+
+- `phone-kernel-scudo-pow2-kib-4-18-1t2t-5rep-20260513-1750`：
+  使用 Scudo standalone 脚本默认构建的 bench，全部输出
+  `SharedArena: ready=0` / `delegated skipped (pool not ready)`，只能说明传统
+  路径和设备在这轮下未立刻挂，不能作为 delegated 性能数据。
+- `phone-kernel-scudo-pow2-kib-4-18-1t2t-valid-3rep-20260513-1758`：
+  使用内核 Makefile bench 但未加 `--use-su`，非 root adb shell 无法有效接收
+  broker fd，同样 `SharedArena: ready=0`。
+- `phone-kernel-scudo-sanity-combined-20260513-1802` /
+  `phone-kernel-scudo-sanity-fixed-20260513-1805`：确认仅加
+  `--allocator combined` 或仅修 benchmark init 仍不够；需要 root 运行。
+
+
+如需确认系统 broker 状态：
 
 ```bash
 ssh lrc@192.168.61.4 \
-  "/opt/homebrew/bin/adb shell 'ps -A | grep -E \"scudo_shared|ScudoShared\" || true'"
+  "/opt/homebrew/bin/adb shell \"su -c 'ps -A | grep -E \\\"memory_delegation_broker|scudo_shared|ScudoShared\\\" || true; \
+                                 cat /data/local/tmp/md/broker.log 2>/dev/null | tail -n 40 || true'\""
 ```
 
-当前 broker 伴随进程方案中，父进程退出后 broker 会收到 `SIGTERM` 自动退出；
-正常情况下应用和测试脚本不需要手工清理 broker。
+当前 Android 方案使用常驻 `memory_delegation_broker` 持有 arena backing；
+应用进程不会创建或 fork broker。测试脚本默认会在运行前清理旧 broker 并启动新 broker。
+
+手动跑真机 bench 前需要保证 broker 已经在手机侧运行。可以复用 correctness
+runner 的 broker 管理逻辑先启动一次：
+
+```bash
+cd /home/lrc/patent/kernel/kernel_platform/common
+
+BUILD=1 BUILD_MODE=android START_BROKER=1 \
+EXTRA_ENV="SCUDO_SHARED_ARENA_TEST_MODE=init_only SCUDO_SHARED_ARENA_TEST_CPU=0" \
+tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
+```
 
 ## 3. QEMU benchmark
 
 当前 QEMU 已用于验证“新内核 + 改造 Scudo”在大块分配上的修复效果。
 最新稳定验证配置是 4 线程、`4 MiB` 到 `256 MiB`、`--touch-pages 1`，
 完整跑完并正常 poweroff。
+
+QEMU 使用 `MODE=linux` 静态 ELF，SharedArena backing 走 Linux
+`shm_open`/`/dev/shm` 路径，不依赖 Android 的 `memory_delegation_broker`。
+
+### 3.0 QEMU correctness smoke
+
+一键正确性测试：
+
+```bash
+cd /home/lrc/patent/kernel/kernel_platform/common
+tools/testing/memory_delegation/scripts/run_qemu_tests.sh
+```
+
+最近一次通过记录：
+
+```text
+2026-05-13
+log: /tmp/md-qemu-run/qemu-serial.log
+result: PASS: scudo_shared_arena_test succeeded under QEMU (3 runs)
+```
+
+覆盖项包括 pressure toggle、single-process、multi-thread、lifecycle、
+CPU 0/1 retrieve-store，以及 CPU 0 -> CPU 1 cross-free migration。
 
 ### 3.1 编译 benchmark
 

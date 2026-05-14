@@ -8,6 +8,7 @@
 #include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/highmem.h>
+#include <linux/limits.h>
 #include <linux/memory_delegation.h>
 #include <linux/mm.h>
 #include <linux/mmap_lock.h>
@@ -35,7 +36,13 @@
 #define MD_SHARED_ARENA_HEADER_SIZE	PAGE_SIZE
 #define MD_SHARED_ARENA_NR_PAGES	\
 	((MD_SHARED_ARENA_CAPACITY - MD_SHARED_ARENA_HEADER_SIZE) / PAGE_SIZE)
+#define MD_SHARED_ARENA_NR_CHUNKS	\
+	DIV_ROUND_UP(MD_SHARED_ARENA_NR_PAGES, MD_CHUNK_PAGES)
 #define MD_DEFAULT_OWNER_SLOTS		254
+#define MD_SHARED_ARENA_FREELIST_END	U32_MAX
+#define MD_SHARED_ARENA_FREE_MAGIC	0xF4EEB10cU
+#define MD_SHARED_ARENA_READY_VERSION	2U
+#define MD_USER_ARENA_LOCK_RETRIES	1000000U
 
 enum md_sync_state {
 	MD_SYNC_IDLE = 0,
@@ -49,6 +56,31 @@ struct md_owner_entry {
 	u32 gen;
 	u32 ref_pages;
 	bool valid;
+};
+
+struct md_user_free_block {
+	u32 prev_page_off;
+	u32 next_page_off;
+	u32 size_in_pages;
+	u32 magic;
+};
+
+struct md_user_arena_header {
+	u32 lock;
+	u32 version;
+	u32 bump_offset_in_pages;
+	u32 total_data_pages;
+	u32 freelist_head_page_off;
+	u32 free_count;
+	unsigned long total_donated_bytes;
+	unsigned long total_retrieved_bytes;
+	u32 donate_count;
+	u32 retrieve_count;
+};
+
+struct md_page_run {
+	u32 start;
+	u32 nr_pages;
 };
 
 struct md_arena_meta {
@@ -117,7 +149,16 @@ static const struct vm_operations_struct md_arena_vm_ops = {
 	.page_mkwrite = md_arena_vma_page_mkwrite,
 };
 
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+struct md_switch_cycle_stats;
+static bool md_drain_log_ring(struct md_mm_ctx *ctx,
+			      struct md_switch_cycle_stats *stats);
+#else
 static bool md_drain_log_ring(struct md_mm_ctx *ctx);
+#endif
+static int md_memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
+					unsigned long arena_base,
+					bool *out_pte_modified);
 
 /*
  * Number of arenas currently registered.  Incremented under md_arena_table_lock
@@ -133,6 +174,8 @@ struct md_switch_cycle_stats {
 	u64 ctx_switch_calls;
 	u64 ctx_switch_fast_calls;
 	u64 ctx_switch_slow_calls;
+	u64 ctx_switch_log_slow_calls;
+	u64 ctx_switch_pte_slow_calls;
 	u64 ctx_switch_cycles;
 	u64 ctx_switch_fast_cycles;
 	u64 ctx_switch_slow_cycles;
@@ -142,8 +185,29 @@ struct md_switch_cycle_stats {
 	u64 drain_cycles;
 	u64 drain_empty_cycles;
 	u64 drain_nonempty_cycles;
+	u64 drain_scan_cycles;
+	u64 drain_lock_wait_cycles;
+	u64 drain_lock_hold_cycles;
+	u64 drain_apply_cycles;
+	u64 drain_apply_alloc_cycles;
+	u64 drain_apply_free_cycles;
+	u64 drain_alloc_check_cycles;
+	u64 drain_alloc_update_cycles;
+	u64 drain_free_check_cycles;
+	u64 drain_free_update_cycles;
+	u64 drain_commit_cycles;
+	u64 drain_entries;
+	u64 drain_alloc_entries;
+	u64 drain_free_entries;
+	u64 drain_pages;
+	u64 drain_alloc_pages;
+	u64 drain_free_pages;
 	u64 pte_sync_calls;
+	u64 pte_sync_unchanged_calls;
+	u64 pte_sync_modified_calls;
 	u64 pte_sync_cycles;
+	u64 pte_sync_unchanged_cycles;
+	u64 pte_sync_modified_cycles;
 	u64 fork_calls;
 	u64 fork_cycles;
 	u64 max_ctx_switch_cycles;
@@ -152,7 +216,20 @@ struct md_switch_cycle_stats {
 	u64 max_drain_cycles;
 	u64 max_drain_empty_cycles;
 	u64 max_drain_nonempty_cycles;
+	u64 max_drain_scan_cycles;
+	u64 max_drain_lock_wait_cycles;
+	u64 max_drain_lock_hold_cycles;
+	u64 max_drain_apply_cycles;
+	u64 max_drain_apply_alloc_cycles;
+	u64 max_drain_apply_free_cycles;
+	u64 max_drain_alloc_check_cycles;
+	u64 max_drain_alloc_update_cycles;
+	u64 max_drain_free_check_cycles;
+	u64 max_drain_free_update_cycles;
+	u64 max_drain_commit_cycles;
 	u64 max_pte_sync_cycles;
+	u64 max_pte_sync_unchanged_cycles;
+	u64 max_pte_sync_modified_cycles;
 	u64 max_fork_cycles;
 };
 
@@ -169,6 +246,11 @@ static __always_inline void md_stats_add_max(u64 *max, u64 value)
 {
 	if (value > *max)
 		*max = value;
+}
+
+static __always_inline u64 md_stats_avg(u64 cycles, u64 calls)
+{
+	return calls ? div64_u64(cycles, calls) : 0;
 }
 
 static void md_switch_cycle_stats_reset(void)
@@ -188,51 +270,100 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "enabled %u\n", READ_ONCE(md_switch_cycle_stats_enabled));
 	seq_puts(m, "unit cycles\n");
 	seq_puts(m, "clock arm64_arch_timer_cntvct\n");
-	seq_puts(m, "columns cpu ctx_switch ctx_switch_fast ctx_switch_slow drain drain_empty drain_nonempty pte_sync fork avg_ctx_switch avg_ctx_switch_fast avg_ctx_switch_slow avg_drain avg_drain_empty avg_drain_nonempty avg_pte_sync avg_fork max_ctx_switch max_ctx_switch_fast max_ctx_switch_slow max_drain max_drain_empty max_drain_nonempty max_pte_sync max_fork\n");
+	seq_puts(m, "sample ctx_switch requires prev->mm and next->mm both active arena mms\n");
+	seq_puts(m, "columns cpu ctx_switch ctx_switch_fast ctx_switch_slow ctx_switch_log_slow ctx_switch_pte_slow drain drain_empty drain_nonempty pte_sync pte_sync_unchanged pte_sync_modified fork avg_ctx_switch avg_ctx_switch_fast avg_ctx_switch_slow avg_drain avg_drain_empty avg_drain_nonempty avg_pte_sync avg_pte_sync_unchanged avg_pte_sync_modified avg_fork max_ctx_switch max_ctx_switch_fast max_ctx_switch_slow max_drain max_drain_empty max_drain_nonempty max_pte_sync max_pte_sync_unchanged max_pte_sync_modified max_fork\n");
+	seq_puts(m, "drain_detail_columns cpu entries alloc_entries free_entries pages alloc_pages free_pages avg_scan avg_lock_wait avg_lock_hold avg_apply avg_apply_alloc avg_apply_free avg_commit max_scan max_lock_wait max_lock_hold max_apply max_apply_alloc max_apply_free max_commit\n");
+	seq_puts(m, "apply_detail_columns cpu avg_alloc_check avg_alloc_update avg_free_check avg_free_update max_alloc_check max_alloc_update max_free_check max_free_update\n");
 
 	for_each_possible_cpu(cpu) {
 		const struct md_switch_cycle_stats *s =
 			per_cpu_ptr(&md_switch_cycle_stats, cpu);
-		u64 avg_ctx_switch = s->ctx_switch_calls ?
-			div64_u64(s->ctx_switch_cycles, s->ctx_switch_calls) : 0;
-		u64 avg_ctx_switch_fast = s->ctx_switch_fast_calls ?
-			div64_u64(s->ctx_switch_fast_cycles,
-				  s->ctx_switch_fast_calls) : 0;
-		u64 avg_ctx_switch_slow = s->ctx_switch_slow_calls ?
-			div64_u64(s->ctx_switch_slow_cycles,
-				  s->ctx_switch_slow_calls) : 0;
-		u64 avg_drain = s->drain_calls ? div64_u64(s->drain_cycles, s->drain_calls) : 0;
-		u64 avg_drain_empty = s->drain_empty_calls ?
-			div64_u64(s->drain_empty_cycles, s->drain_empty_calls) : 0;
-		u64 avg_drain_nonempty = s->drain_nonempty_calls ?
-			div64_u64(s->drain_nonempty_cycles, s->drain_nonempty_calls) : 0;
-		u64 avg_pte_sync = s->pte_sync_calls ?
-			div64_u64(s->pte_sync_cycles, s->pte_sync_calls) : 0;
-		u64 avg_fork = s->fork_calls ?
-			div64_u64(s->fork_cycles, s->fork_calls) : 0;
 
 		if (!s->ctx_switch_calls && !s->drain_calls &&
 		    !s->pte_sync_calls && !s->fork_calls)
 			continue;
 
 		seq_printf(m,
-			   "cpu%u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+			   "cpu%u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
 			   cpu, s->ctx_switch_calls, s->ctx_switch_fast_calls,
-			   s->ctx_switch_slow_calls, s->drain_calls,
+			   s->ctx_switch_slow_calls,
+			   s->ctx_switch_log_slow_calls,
+			   s->ctx_switch_pte_slow_calls, s->drain_calls,
 			   s->drain_empty_calls, s->drain_nonempty_calls,
-			   s->pte_sync_calls, s->fork_calls, avg_ctx_switch,
-			   avg_ctx_switch_fast, avg_ctx_switch_slow, avg_drain,
-			   avg_drain_empty, avg_drain_nonempty, avg_pte_sync,
-			   avg_fork, s->max_ctx_switch_cycles,
+			   s->pte_sync_calls, s->pte_sync_unchanged_calls,
+			   s->pte_sync_modified_calls, s->fork_calls,
+			   md_stats_avg(s->ctx_switch_cycles, s->ctx_switch_calls),
+			   md_stats_avg(s->ctx_switch_fast_cycles,
+					s->ctx_switch_fast_calls),
+			   md_stats_avg(s->ctx_switch_slow_cycles,
+					s->ctx_switch_slow_calls),
+			   md_stats_avg(s->drain_cycles, s->drain_calls),
+			   md_stats_avg(s->drain_empty_cycles,
+					s->drain_empty_calls),
+			   md_stats_avg(s->drain_nonempty_cycles,
+					s->drain_nonempty_calls),
+			   md_stats_avg(s->pte_sync_cycles, s->pte_sync_calls),
+			   md_stats_avg(s->pte_sync_unchanged_cycles,
+					s->pte_sync_unchanged_calls),
+			   md_stats_avg(s->pte_sync_modified_cycles,
+					s->pte_sync_modified_calls),
+			   md_stats_avg(s->fork_cycles, s->fork_calls),
+			   s->max_ctx_switch_cycles,
 			   s->max_ctx_switch_fast_cycles,
 			   s->max_ctx_switch_slow_cycles, s->max_drain_cycles,
 			   s->max_drain_empty_cycles,
-			   s->max_drain_nonempty_cycles, s->max_pte_sync_cycles,
+			   s->max_drain_nonempty_cycles,
+			   s->max_pte_sync_cycles,
+			   s->max_pte_sync_unchanged_cycles,
+			   s->max_pte_sync_modified_cycles,
 			   s->max_fork_cycles);
+		seq_printf(m,
+			   "drain_detail_cpu%u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+			   cpu, s->drain_entries, s->drain_alloc_entries,
+			   s->drain_free_entries, s->drain_pages,
+			   s->drain_alloc_pages, s->drain_free_pages,
+			   md_stats_avg(s->drain_scan_cycles,
+					s->drain_nonempty_calls),
+			   md_stats_avg(s->drain_lock_wait_cycles,
+					s->drain_nonempty_calls),
+			   md_stats_avg(s->drain_lock_hold_cycles,
+					s->drain_nonempty_calls),
+			   md_stats_avg(s->drain_apply_cycles,
+					s->drain_entries),
+			   md_stats_avg(s->drain_apply_alloc_cycles,
+					s->drain_alloc_entries),
+			   md_stats_avg(s->drain_apply_free_cycles,
+					s->drain_free_entries),
+			   md_stats_avg(s->drain_commit_cycles,
+					s->drain_nonempty_calls),
+			   s->max_drain_scan_cycles,
+			   s->max_drain_lock_wait_cycles,
+			   s->max_drain_lock_hold_cycles,
+			   s->max_drain_apply_cycles,
+			   s->max_drain_apply_alloc_cycles,
+			   s->max_drain_apply_free_cycles,
+			   s->max_drain_commit_cycles);
+		seq_printf(m,
+			   "apply_detail_cpu%u %llu %llu %llu %llu %llu %llu %llu %llu\n",
+			   cpu,
+			   md_stats_avg(s->drain_alloc_check_cycles,
+					s->drain_alloc_entries),
+			   md_stats_avg(s->drain_alloc_update_cycles,
+					s->drain_alloc_entries),
+			   md_stats_avg(s->drain_free_check_cycles,
+					s->drain_free_entries),
+			   md_stats_avg(s->drain_free_update_cycles,
+					s->drain_free_entries),
+			   s->max_drain_alloc_check_cycles,
+			   s->max_drain_alloc_update_cycles,
+			   s->max_drain_free_check_cycles,
+			   s->max_drain_free_update_cycles);
 
 		sum.ctx_switch_calls += s->ctx_switch_calls;
 		sum.ctx_switch_fast_calls += s->ctx_switch_fast_calls;
 		sum.ctx_switch_slow_calls += s->ctx_switch_slow_calls;
+		sum.ctx_switch_log_slow_calls += s->ctx_switch_log_slow_calls;
+		sum.ctx_switch_pte_slow_calls += s->ctx_switch_pte_slow_calls;
 		sum.ctx_switch_cycles += s->ctx_switch_cycles;
 		sum.ctx_switch_fast_cycles += s->ctx_switch_fast_cycles;
 		sum.ctx_switch_slow_cycles += s->ctx_switch_slow_cycles;
@@ -242,8 +373,29 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 		sum.drain_cycles += s->drain_cycles;
 		sum.drain_empty_cycles += s->drain_empty_cycles;
 		sum.drain_nonempty_cycles += s->drain_nonempty_cycles;
+		sum.drain_scan_cycles += s->drain_scan_cycles;
+		sum.drain_lock_wait_cycles += s->drain_lock_wait_cycles;
+		sum.drain_lock_hold_cycles += s->drain_lock_hold_cycles;
+		sum.drain_apply_cycles += s->drain_apply_cycles;
+		sum.drain_apply_alloc_cycles += s->drain_apply_alloc_cycles;
+		sum.drain_apply_free_cycles += s->drain_apply_free_cycles;
+		sum.drain_alloc_check_cycles += s->drain_alloc_check_cycles;
+		sum.drain_alloc_update_cycles += s->drain_alloc_update_cycles;
+		sum.drain_free_check_cycles += s->drain_free_check_cycles;
+		sum.drain_free_update_cycles += s->drain_free_update_cycles;
+		sum.drain_commit_cycles += s->drain_commit_cycles;
+		sum.drain_entries += s->drain_entries;
+		sum.drain_alloc_entries += s->drain_alloc_entries;
+		sum.drain_free_entries += s->drain_free_entries;
+		sum.drain_pages += s->drain_pages;
+		sum.drain_alloc_pages += s->drain_alloc_pages;
+		sum.drain_free_pages += s->drain_free_pages;
 		sum.pte_sync_calls += s->pte_sync_calls;
+		sum.pte_sync_unchanged_calls += s->pte_sync_unchanged_calls;
+		sum.pte_sync_modified_calls += s->pte_sync_modified_calls;
 		sum.pte_sync_cycles += s->pte_sync_cycles;
+		sum.pte_sync_unchanged_cycles += s->pte_sync_unchanged_cycles;
+		sum.pte_sync_modified_cycles += s->pte_sync_modified_cycles;
 		sum.fork_calls += s->fork_calls;
 		sum.fork_cycles += s->fork_cycles;
 		md_stats_add_max(&sum.max_ctx_switch_cycles,
@@ -257,41 +409,103 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 				 s->max_drain_empty_cycles);
 		md_stats_add_max(&sum.max_drain_nonempty_cycles,
 				 s->max_drain_nonempty_cycles);
+		md_stats_add_max(&sum.max_drain_scan_cycles,
+				 s->max_drain_scan_cycles);
+		md_stats_add_max(&sum.max_drain_lock_wait_cycles,
+				 s->max_drain_lock_wait_cycles);
+		md_stats_add_max(&sum.max_drain_lock_hold_cycles,
+				 s->max_drain_lock_hold_cycles);
+		md_stats_add_max(&sum.max_drain_apply_cycles,
+				 s->max_drain_apply_cycles);
+		md_stats_add_max(&sum.max_drain_apply_alloc_cycles,
+				 s->max_drain_apply_alloc_cycles);
+		md_stats_add_max(&sum.max_drain_apply_free_cycles,
+				 s->max_drain_apply_free_cycles);
+		md_stats_add_max(&sum.max_drain_alloc_check_cycles,
+				 s->max_drain_alloc_check_cycles);
+		md_stats_add_max(&sum.max_drain_alloc_update_cycles,
+				 s->max_drain_alloc_update_cycles);
+		md_stats_add_max(&sum.max_drain_free_check_cycles,
+				 s->max_drain_free_check_cycles);
+		md_stats_add_max(&sum.max_drain_free_update_cycles,
+				 s->max_drain_free_update_cycles);
+		md_stats_add_max(&sum.max_drain_commit_cycles,
+				 s->max_drain_commit_cycles);
 		md_stats_add_max(&sum.max_pte_sync_cycles, s->max_pte_sync_cycles);
+		md_stats_add_max(&sum.max_pte_sync_unchanged_cycles,
+				 s->max_pte_sync_unchanged_cycles);
+		md_stats_add_max(&sum.max_pte_sync_modified_cycles,
+				 s->max_pte_sync_modified_cycles);
 		md_stats_add_max(&sum.max_fork_cycles, s->max_fork_cycles);
 	}
 
 	seq_printf(m,
-		   "total %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+		   "total %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
 		   sum.ctx_switch_calls, sum.ctx_switch_fast_calls,
-		   sum.ctx_switch_slow_calls, sum.drain_calls,
+		   sum.ctx_switch_slow_calls, sum.ctx_switch_log_slow_calls,
+		   sum.ctx_switch_pte_slow_calls, sum.drain_calls,
 		   sum.drain_empty_calls, sum.drain_nonempty_calls,
-		   sum.pte_sync_calls, sum.fork_calls,
-		   sum.ctx_switch_calls ?
-			   div64_u64(sum.ctx_switch_cycles,
-				     sum.ctx_switch_calls) : 0,
-		   sum.ctx_switch_fast_calls ?
-			   div64_u64(sum.ctx_switch_fast_cycles,
-				     sum.ctx_switch_fast_calls) : 0,
-		   sum.ctx_switch_slow_calls ?
-			   div64_u64(sum.ctx_switch_slow_cycles,
-				     sum.ctx_switch_slow_calls) : 0,
-		   sum.drain_calls ? div64_u64(sum.drain_cycles, sum.drain_calls) : 0,
-		   sum.drain_empty_calls ?
-			   div64_u64(sum.drain_empty_cycles,
-				     sum.drain_empty_calls) : 0,
-		   sum.drain_nonempty_calls ?
-			   div64_u64(sum.drain_nonempty_cycles,
-				     sum.drain_nonempty_calls) : 0,
-		   sum.pte_sync_calls ?
-			   div64_u64(sum.pte_sync_cycles,
-				     sum.pte_sync_calls) : 0,
-		   sum.fork_calls ? div64_u64(sum.fork_cycles,
-					      sum.fork_calls) : 0,
+		   sum.pte_sync_calls, sum.pte_sync_unchanged_calls,
+		   sum.pte_sync_modified_calls, sum.fork_calls,
+		   md_stats_avg(sum.ctx_switch_cycles, sum.ctx_switch_calls),
+		   md_stats_avg(sum.ctx_switch_fast_cycles,
+				sum.ctx_switch_fast_calls),
+		   md_stats_avg(sum.ctx_switch_slow_cycles,
+				sum.ctx_switch_slow_calls),
+		   md_stats_avg(sum.drain_cycles, sum.drain_calls),
+		   md_stats_avg(sum.drain_empty_cycles,
+				sum.drain_empty_calls),
+		   md_stats_avg(sum.drain_nonempty_cycles,
+				sum.drain_nonempty_calls),
+		   md_stats_avg(sum.pte_sync_cycles, sum.pte_sync_calls),
+		   md_stats_avg(sum.pte_sync_unchanged_cycles,
+				sum.pte_sync_unchanged_calls),
+		   md_stats_avg(sum.pte_sync_modified_cycles,
+				sum.pte_sync_modified_calls),
+		   md_stats_avg(sum.fork_cycles, sum.fork_calls),
 		   sum.max_ctx_switch_cycles, sum.max_ctx_switch_fast_cycles,
 		   sum.max_ctx_switch_slow_cycles, sum.max_drain_cycles,
 		   sum.max_drain_empty_cycles, sum.max_drain_nonempty_cycles,
-		   sum.max_pte_sync_cycles, sum.max_fork_cycles);
+		   sum.max_pte_sync_cycles, sum.max_pte_sync_unchanged_cycles,
+		   sum.max_pte_sync_modified_cycles, sum.max_fork_cycles);
+	seq_printf(m,
+		   "drain_detail_total %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+		   sum.drain_entries, sum.drain_alloc_entries,
+		   sum.drain_free_entries, sum.drain_pages,
+		   sum.drain_alloc_pages, sum.drain_free_pages,
+		   md_stats_avg(sum.drain_scan_cycles,
+				sum.drain_nonempty_calls),
+		   md_stats_avg(sum.drain_lock_wait_cycles,
+				sum.drain_nonempty_calls),
+		   md_stats_avg(sum.drain_lock_hold_cycles,
+				sum.drain_nonempty_calls),
+		   md_stats_avg(sum.drain_apply_cycles,
+				sum.drain_entries),
+		   md_stats_avg(sum.drain_apply_alloc_cycles,
+				sum.drain_alloc_entries),
+		   md_stats_avg(sum.drain_apply_free_cycles,
+				sum.drain_free_entries),
+		   md_stats_avg(sum.drain_commit_cycles,
+				sum.drain_nonempty_calls),
+		   sum.max_drain_scan_cycles, sum.max_drain_lock_wait_cycles,
+		   sum.max_drain_lock_hold_cycles, sum.max_drain_apply_cycles,
+		   sum.max_drain_apply_alloc_cycles,
+		   sum.max_drain_apply_free_cycles,
+		   sum.max_drain_commit_cycles);
+	seq_printf(m,
+		   "apply_detail_total %llu %llu %llu %llu %llu %llu %llu %llu\n",
+		   md_stats_avg(sum.drain_alloc_check_cycles,
+				sum.drain_alloc_entries),
+		   md_stats_avg(sum.drain_alloc_update_cycles,
+				sum.drain_alloc_entries),
+		   md_stats_avg(sum.drain_free_check_cycles,
+				sum.drain_free_entries),
+		   md_stats_avg(sum.drain_free_update_cycles,
+				sum.drain_free_entries),
+		   sum.max_drain_alloc_check_cycles,
+		   sum.max_drain_alloc_update_cycles,
+		   sum.max_drain_free_check_cycles,
+		   sum.max_drain_free_update_cycles);
 	return 0;
 }
 
@@ -993,6 +1207,325 @@ static int md_prefault_range_locked(struct mm_struct *mm, unsigned long start,
 	return 0;
 }
 
+static unsigned long md_user_free_block_addr(unsigned long arena_base,
+					     u32 page_off)
+{
+	return arena_base + (unsigned long)page_off * PAGE_SIZE;
+}
+
+static int md_user_read(struct mm_struct *mm, unsigned long addr,
+			void *buf, size_t len)
+{
+	int copied;
+
+	if (len > INT_MAX)
+		return -EINVAL;
+
+	copied = access_remote_vm(mm, addr, buf, len, 0);
+	return copied == len ? 0 : -EFAULT;
+}
+
+static int md_user_write(struct mm_struct *mm, unsigned long addr,
+			 const void *buf, size_t len)
+{
+	int copied;
+
+	if (len > INT_MAX)
+		return -EINVAL;
+
+	copied = access_remote_vm(mm, addr, (void *)buf, len, FOLL_WRITE);
+	return copied == len ? 0 : -EFAULT;
+}
+
+static int md_user_write_u32(struct mm_struct *mm, unsigned long addr, u32 value)
+{
+	return md_user_write(mm, addr, &value, sizeof(value));
+}
+
+static int md_user_write_ulong(struct mm_struct *mm, unsigned long addr,
+			       unsigned long value)
+{
+	return md_user_write(mm, addr, &value, sizeof(value));
+}
+
+static int md_user_read_free_block(struct mm_struct *mm, unsigned long arena_base,
+				   u32 page_off, struct md_user_free_block *block)
+{
+	return md_user_read(mm, md_user_free_block_addr(arena_base, page_off),
+			    block, sizeof(*block));
+}
+
+static int md_user_write_free_block(struct mm_struct *mm,
+				    unsigned long arena_base, u32 page_off,
+				    const struct md_user_free_block *block)
+{
+	return md_user_write(mm, md_user_free_block_addr(arena_base, page_off),
+			     block, sizeof(*block));
+}
+
+static int md_user_arena_lock(struct mm_struct *mm, unsigned long arena_base,
+			      struct page **out_page)
+{
+	unsigned long header_addr;
+	struct page *page;
+	unsigned int retry;
+	long pinned;
+	int locked = 1;
+
+	if (!arena_base || arena_base < MD_SHARED_ARENA_HEADER_SIZE)
+		return -EINVAL;
+
+	header_addr = arena_base - MD_SHARED_ARENA_HEADER_SIZE;
+	mmap_read_lock(mm);
+	pinned = get_user_pages_remote(mm, header_addr, 1, FOLL_WRITE,
+				       &page, &locked);
+	if (locked)
+		mmap_read_unlock(mm);
+	if (pinned < 0)
+		return pinned;
+	if (pinned != 1) {
+		if (pinned > 0)
+			put_page(page);
+		return -EFAULT;
+	}
+
+	for (retry = 0; retry < MD_USER_ARENA_LOCK_RETRIES; retry++) {
+		void *kaddr = kmap_local_page(page);
+		struct md_user_arena_header *hdr;
+		int old;
+
+		hdr = (struct md_user_arena_header *)((char *)kaddr +
+						      offset_in_page(header_addr));
+		old = atomic_cmpxchg_acquire((atomic_t *)&hdr->lock, 0, 1);
+		kunmap_local(kaddr);
+
+		if (!old) {
+			*out_page = page;
+			return 0;
+		}
+
+		if (!(retry & 0xff))
+			cond_resched();
+		else
+			cpu_relax();
+	}
+
+	put_page(page);
+	return -EBUSY;
+}
+
+static void md_user_arena_unlock(struct page *page, unsigned long arena_base)
+{
+	unsigned long header_addr = arena_base - MD_SHARED_ARENA_HEADER_SIZE;
+	void *kaddr = kmap_local_page(page);
+	struct md_user_arena_header *hdr;
+
+	hdr = (struct md_user_arena_header *)((char *)kaddr +
+					      offset_in_page(header_addr));
+	atomic_set_release((atomic_t *)&hdr->lock, 0);
+	kunmap_local(kaddr);
+	put_page(page);
+}
+
+static int md_user_freelist_insert_locked(struct mm_struct *mm,
+					  unsigned long arena_base,
+					  u32 start, u32 nr_pages)
+{
+	unsigned long header_addr = arena_base - MD_SHARED_ARENA_HEADER_SIZE;
+	struct md_user_arena_header hdr;
+	struct md_user_free_block new_block;
+	u32 prev = MD_SHARED_ARENA_FREELIST_END;
+	u32 next;
+	u32 walk_guard = 0;
+	int ret;
+
+	if (!nr_pages)
+		return 0;
+
+	ret = md_user_read(mm, header_addr, &hdr, sizeof(hdr));
+	if (ret)
+		return ret;
+	if (hdr.version < MD_SHARED_ARENA_READY_VERSION ||
+	    hdr.total_data_pages < start ||
+	    nr_pages > hdr.total_data_pages - start) {
+		pr_warn_ratelimited(
+			"memory_delegation: userspace freelist header invalid base=%lx start=%u pages=%u version=%u total=%u head=%u count=%u\n",
+			arena_base, start, nr_pages, hdr.version,
+			hdr.total_data_pages, hdr.freelist_head_page_off,
+			hdr.free_count);
+		return -EINVAL;
+	}
+
+	next = hdr.freelist_head_page_off;
+	while (next != MD_SHARED_ARENA_FREELIST_END) {
+		struct md_user_free_block block;
+
+		if (next >= hdr.total_data_pages || walk_guard++ >= hdr.free_count) {
+			pr_warn_ratelimited(
+				"memory_delegation: userspace freelist walk invalid base=%lx start=%u pages=%u next=%u total=%u guard=%u count=%u head=%u\n",
+				arena_base, start, nr_pages, next,
+				hdr.total_data_pages, walk_guard, hdr.free_count,
+				hdr.freelist_head_page_off);
+			return -EINVAL;
+		}
+		if (next > start)
+			break;
+
+		ret = md_user_read_free_block(mm, arena_base, next, &block);
+		if (ret)
+			return ret;
+		if (block.magic != MD_SHARED_ARENA_FREE_MAGIC ||
+		    !block.size_in_pages ||
+		    block.size_in_pages > hdr.total_data_pages - next) {
+			pr_warn_ratelimited(
+				"memory_delegation: userspace freelist block invalid base=%lx off=%u prev=%u next=%u size=%u magic=%x total=%u\n",
+				arena_base, next, block.prev_page_off,
+				block.next_page_off, block.size_in_pages,
+				block.magic, hdr.total_data_pages);
+			return -EINVAL;
+		}
+
+		prev = next;
+		next = block.next_page_off;
+	}
+
+	new_block.prev_page_off = prev;
+	new_block.next_page_off = next;
+	new_block.size_in_pages = nr_pages;
+	new_block.magic = MD_SHARED_ARENA_FREE_MAGIC;
+	ret = md_user_write_free_block(mm, arena_base, start, &new_block);
+	if (ret)
+		return ret;
+
+	if (prev != MD_SHARED_ARENA_FREELIST_END) {
+		unsigned long prev_next_addr;
+
+		prev_next_addr = md_user_free_block_addr(arena_base, prev) +
+			offsetof(struct md_user_free_block, next_page_off);
+		ret = md_user_write_u32(mm, prev_next_addr, start);
+		if (ret)
+			return ret;
+	} else {
+		hdr.freelist_head_page_off = start;
+	}
+
+	if (next != MD_SHARED_ARENA_FREELIST_END) {
+		unsigned long next_prev_addr;
+
+		next_prev_addr = md_user_free_block_addr(arena_base, next) +
+			offsetof(struct md_user_free_block, prev_page_off);
+		ret = md_user_write_u32(mm, next_prev_addr, start);
+		if (ret)
+			return ret;
+	}
+
+	hdr.free_count++;
+
+	if (next != MD_SHARED_ARENA_FREELIST_END &&
+	    start + new_block.size_in_pages == next) {
+		struct md_user_free_block next_block;
+		u32 zero = 0;
+
+		ret = md_user_read_free_block(mm, arena_base, next, &next_block);
+		if (ret)
+			return ret;
+		if (next_block.magic != MD_SHARED_ARENA_FREE_MAGIC ||
+		    !next_block.size_in_pages ||
+		    next_block.size_in_pages > hdr.total_data_pages - next)
+			return -EINVAL;
+
+		new_block.size_in_pages += next_block.size_in_pages;
+		new_block.next_page_off = next_block.next_page_off;
+		ret = md_user_write_free_block(mm, arena_base, start, &new_block);
+		if (ret)
+			return ret;
+		if (next_block.next_page_off != MD_SHARED_ARENA_FREELIST_END) {
+			unsigned long next_next_prev_addr;
+
+			next_next_prev_addr = md_user_free_block_addr(arena_base,
+								      next_block.next_page_off);
+			next_next_prev_addr += offsetof(struct md_user_free_block,
+							prev_page_off);
+			ret = md_user_write_u32(mm, next_next_prev_addr, start);
+			if (ret)
+				return ret;
+		}
+		ret = md_user_write_u32(mm,
+					md_user_free_block_addr(arena_base, next) +
+					offsetof(struct md_user_free_block, magic),
+					zero);
+		if (ret)
+			return ret;
+		hdr.free_count--;
+	}
+
+	if (prev != MD_SHARED_ARENA_FREELIST_END) {
+		struct md_user_free_block prev_block;
+
+		ret = md_user_read_free_block(mm, arena_base, prev, &prev_block);
+		if (ret)
+			return ret;
+		if (prev_block.magic != MD_SHARED_ARENA_FREE_MAGIC ||
+		    !prev_block.size_in_pages ||
+		    prev_block.size_in_pages > hdr.total_data_pages - prev)
+			return -EINVAL;
+
+		if (prev + prev_block.size_in_pages == start) {
+			u32 zero = 0;
+
+			prev_block.size_in_pages += new_block.size_in_pages;
+			prev_block.next_page_off = new_block.next_page_off;
+			ret = md_user_write_free_block(mm, arena_base, prev,
+						       &prev_block);
+			if (ret)
+				return ret;
+			if (new_block.next_page_off !=
+			    MD_SHARED_ARENA_FREELIST_END) {
+				unsigned long new_next_prev_addr;
+
+				new_next_prev_addr =
+					md_user_free_block_addr(arena_base,
+								new_block.next_page_off);
+				new_next_prev_addr += offsetof(struct md_user_free_block,
+							       prev_page_off);
+				ret = md_user_write_u32(mm, new_next_prev_addr,
+							prev);
+				if (ret)
+					return ret;
+			}
+			ret = md_user_write_u32(mm,
+						md_user_free_block_addr(arena_base, start) +
+						offsetof(struct md_user_free_block, magic),
+						zero);
+			if (ret)
+				return ret;
+			hdr.free_count--;
+		}
+	}
+
+	hdr.total_donated_bytes += (unsigned long)nr_pages * PAGE_SIZE;
+	hdr.donate_count++;
+
+	ret = md_user_write_u32(mm, header_addr +
+		offsetof(struct md_user_arena_header, freelist_head_page_off),
+		hdr.freelist_head_page_off);
+	if (ret)
+		return ret;
+	ret = md_user_write_u32(mm, header_addr +
+		offsetof(struct md_user_arena_header, free_count),
+		hdr.free_count);
+	if (ret)
+		return ret;
+	ret = md_user_write_ulong(mm, header_addr +
+		offsetof(struct md_user_arena_header, total_donated_bytes),
+		hdr.total_donated_bytes);
+	if (ret)
+		return ret;
+	return md_user_write_u32(mm, header_addr +
+		offsetof(struct md_user_arena_header, donate_count),
+		hdr.donate_count);
+}
+
 /* 功能：在 arena 锁保护下获取或分配某个 mm 的 owner slot；调用时机：应用 alloc shadow log 时调用。 */
 static u16 md_get_owner_slot_locked(struct md_arena_meta *arena,
 				    struct mm_struct *mm)
@@ -1049,7 +1582,11 @@ static void md_mark_dirty_chunks(unsigned long *dirty_chunks, u32 start, u32 end
 static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 				     const struct md_shadow_log *entry,
 				     struct mm_struct *owner_mm,
-				     unsigned long *dirty_chunks)
+				     unsigned long *dirty_chunks
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+				     , struct md_switch_cycle_stats *stats
+#endif
+				     )
 {
 	u32 start = entry->start_page;
 	u32 end;
@@ -1065,15 +1602,53 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 	if (entry->op == MD_LOG_ALLOC) {
 		u16 slot;
 		u32 owner_gen;
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		u64 phase_start = 0;
+		u64 phase_delta;
+
+		if (stats)
+			phase_start = md_read_cycles();
+#endif
 
 		for (i = start; i < end; i++) {
-			if (arena->page_slot[i] != MD_INVALID_SLOT)
+			if (arena->page_slot[i] != MD_INVALID_SLOT) {
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+				if (stats) {
+					phase_delta = md_read_cycles() -
+						phase_start;
+					stats->drain_alloc_check_cycles +=
+						phase_delta;
+					md_stats_add_max(
+						&stats->max_drain_alloc_check_cycles,
+						phase_delta);
+				}
+#endif
 				return -EBUSY;
+			}
 		}
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		if (stats) {
+			phase_delta = md_read_cycles() - phase_start;
+			stats->drain_alloc_check_cycles += phase_delta;
+			md_stats_add_max(&stats->max_drain_alloc_check_cycles,
+					 phase_delta);
+			phase_start = md_read_cycles();
+		}
+#endif
 
 		slot = md_get_owner_slot_locked(arena, owner_mm);
-		if (slot == U16_MAX)
+		if (slot == U16_MAX) {
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+			if (stats) {
+				phase_delta = md_read_cycles() - phase_start;
+				stats->drain_alloc_update_cycles += phase_delta;
+				md_stats_add_max(
+					&stats->max_drain_alloc_update_cycles,
+					phase_delta);
+			}
+#endif
 			return -ENOSPC;
+		}
 
 		owner_gen = arena->owner_table[slot].gen;
 		for (i = start; i < end; i++) {
@@ -1085,14 +1660,50 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 		}
 		arena->owner_table[slot].ref_pages += end - start;
 		md_mark_dirty_chunks(dirty_chunks, start, end);
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		if (stats) {
+			phase_delta = md_read_cycles() - phase_start;
+			stats->drain_alloc_update_cycles += phase_delta;
+			md_stats_add_max(&stats->max_drain_alloc_update_cycles,
+					 phase_delta);
+		}
+#endif
 		return 0;
 	}
 
 	if (entry->op == MD_LOG_FREE) {
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		u64 phase_start = 0;
+		u64 phase_delta;
+
+		if (stats)
+			phase_start = md_read_cycles();
+#endif
 		for (i = start; i < end; i++) {
-			if (!md_page_belongs_to_mm_locked(arena, i, owner_mm))
+			if (!md_page_belongs_to_mm_locked(arena, i, owner_mm)) {
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+				if (stats) {
+					phase_delta = md_read_cycles() -
+						phase_start;
+					stats->drain_free_check_cycles +=
+						phase_delta;
+					md_stats_add_max(
+						&stats->max_drain_free_check_cycles,
+						phase_delta);
+				}
+#endif
 				return -EPERM;
+			}
 		}
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		if (stats) {
+			phase_delta = md_read_cycles() - phase_start;
+			stats->drain_free_check_cycles += phase_delta;
+			md_stats_add_max(&stats->max_drain_free_check_cycles,
+					 phase_delta);
+			phase_start = md_read_cycles();
+		}
+#endif
 
 		for (i = start; i < end; i++) {
 			u16 slot = arena->page_slot[i];
@@ -1113,6 +1724,14 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 			md_put_owner_slot_locked(arena, slot);
 		}
 		md_mark_dirty_chunks(dirty_chunks, start, end);
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		if (stats) {
+			phase_delta = md_read_cycles() - phase_start;
+			stats->drain_free_update_cycles += phase_delta;
+			md_stats_add_max(&stats->max_drain_free_update_cycles,
+					 phase_delta);
+		}
+#endif
 		return 0;
 	}
 
@@ -1185,7 +1804,12 @@ static void md_reset_all_arenas_if_idle(void)
 }
 
 /* 功能：消费 ctx 关联的 shadow log ring 并按 src_cpu 分发提交到目标 arena；调用时机：进程切出 CPU 的 context switch 路径调用。 */
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+static bool md_drain_log_ring(struct md_mm_ctx *ctx,
+			      struct md_switch_cycle_stats *stats)
+#else
 static bool md_drain_log_ring(struct md_mm_ctx *ctx)
+#endif
 {
 	DECLARE_BITMAP(dirty_chunks, DIV_ROUND_UP(MD_SHARED_ARENA_NR_PAGES,
 						  MD_CHUNK_PAGES));
@@ -1197,6 +1821,13 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 	u32 head, tail, i;
 	unsigned long src_cpu;
 	bool had_entries = false;
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+	u64 scan_start = 0;
+	u64 scan_delta;
+
+	if (stats)
+		scan_start = md_read_cycles();
+#endif
 
 	if (!ctx || !ctx->key.mm)
 		return false;
@@ -1247,6 +1878,13 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 		if (src < nr_cpu_ids)
 			__set_bit(src, src_cpus);
 	}
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+	if (stats) {
+		scan_delta = md_read_cycles() - scan_start;
+		stats->drain_scan_cycles += scan_delta;
+		md_stats_add_max(&stats->max_drain_scan_cycles, scan_delta);
+	}
+#endif
 
 	/*
 	 * Pass 2: for each referenced arena, acquire its lock and apply all
@@ -1267,6 +1905,85 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 		}
 
 		// 本cpu的log可能涉及其他arena的修改（该线程可能在其他cpu上分配了内存才迁移至此）
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+		if (stats) {
+			u64 lock_start = md_read_cycles();
+			u64 lock_wait;
+			u64 lock_hold_start;
+			u64 lock_hold_delta;
+
+			spin_lock(&arena->lock);
+			lock_wait = md_read_cycles() - lock_start;
+			lock_hold_start = md_read_cycles();
+			stats->drain_lock_wait_cycles += lock_wait;
+			md_stats_add_max(&stats->max_drain_lock_wait_cycles,
+					 lock_wait);
+			for (i = head; i != tail; i++) {
+				const struct md_shadow_log *entry =
+					&entries[i % ring->capacity];
+				u64 apply_start;
+				u64 apply_delta;
+				int ret;
+
+				if (entry->src_cpu != (u8)src_cpu)
+					continue;
+
+				apply_start = md_read_cycles();
+				ret = md_apply_log_entry_locked(arena, entry,
+								ctx->key.mm,
+								dirty_chunks,
+								stats);
+				apply_delta = md_read_cycles() - apply_start;
+
+				stats->drain_entries++;
+				stats->drain_pages += entry->nr_pages;
+				stats->drain_apply_cycles += apply_delta;
+				md_stats_add_max(&stats->max_drain_apply_cycles,
+						 apply_delta);
+				if (entry->op == MD_LOG_ALLOC) {
+					stats->drain_alloc_entries++;
+					stats->drain_alloc_pages += entry->nr_pages;
+					stats->drain_apply_alloc_cycles +=
+						apply_delta;
+					md_stats_add_max(
+						&stats->max_drain_apply_alloc_cycles,
+						apply_delta);
+				} else if (entry->op == MD_LOG_FREE) {
+					stats->drain_free_entries++;
+					stats->drain_free_pages += entry->nr_pages;
+					stats->drain_apply_free_cycles +=
+						apply_delta;
+					md_stats_add_max(
+						&stats->max_drain_apply_free_cycles,
+						apply_delta);
+				}
+
+				if (ret)
+					pr_warn_ratelimited(
+						"memory_delegation: drop log op=%u src_cpu=%u start=%u pages=%u ret=%d\n",
+						entry->op, entry->src_cpu,
+						entry->start_page, entry->nr_pages,
+						ret);
+			}
+			{
+				u64 commit_start = md_read_cycles();
+				u64 commit_delta;
+
+				md_commit_dirty_chunks_locked(arena, dirty_chunks);
+				commit_delta = md_read_cycles() - commit_start;
+				stats->drain_commit_cycles += commit_delta;
+				md_stats_add_max(&stats->max_drain_commit_cycles,
+						 commit_delta);
+			}
+			lock_hold_delta = md_read_cycles() - lock_hold_start;
+			stats->drain_lock_hold_cycles += lock_hold_delta;
+			md_stats_add_max(&stats->max_drain_lock_hold_cycles,
+					 lock_hold_delta);
+			spin_unlock(&arena->lock);
+			rcu_read_unlock();
+			continue;
+		}
+#endif
 		spin_lock(&arena->lock);
 		for (i = head; i != tail; i++) {
 			const struct md_shadow_log *entry =
@@ -1278,7 +1995,11 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 
 			ret = md_apply_log_entry_locked(arena, entry,
 							ctx->key.mm,
-							dirty_chunks);
+							dirty_chunks
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+							, NULL
+#endif
+							);
 			if (ret)
 				pr_warn_ratelimited(
 					"memory_delegation: drop log op=%u src_cpu=%u start=%u pages=%u ret=%d\n",
@@ -1297,7 +2018,7 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx)
 }
 
 /* 功能：按需给即将运行的 task 排队一次 arena 页表同步 task_work；调用时机：进程切入 CPU 且 arena 有新提交时调用。 */
-static void md_queue_sync_if_needed(struct md_mm_ctx *ctx,
+static bool md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 				    struct task_struct *task, u64 latest_seq)
 {
 	bool queue = false;
@@ -1306,7 +2027,7 @@ static void md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 	unsigned int state;
 
 	if (!arena_base || latest_seq <= last_seen)
-		return;
+		return false;
 
 	state = cmpxchg(&ctx->sync_state, MD_SYNC_IDLE, MD_SYNC_QUEUED);
 	if (state == MD_SYNC_IDLE) {
@@ -1319,7 +2040,7 @@ static void md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 	}
 
 	if (!queue)
-		return;
+		return false;
 
 	if (task_work_add(task, &ctx->sync_work, TWA_RESUME)) {
 		pr_warn_ratelimited(
@@ -1328,7 +2049,10 @@ static void md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 			last_seen, latest_seq);
 		WRITE_ONCE(ctx->sync_state, MD_SYNC_IDLE);
 		md_mm_ctx_put(ctx);
+		return false;
 	}
+
+	return true;
 }
 
 /* 功能：在可睡眠 task_work 上下文中执行当前 mm 的 arena 页表同步；调用时机：task 返回用户态前由 task_work 调用。 */
@@ -1348,12 +2072,17 @@ static void md_sync_task_work(struct callback_head *work)
 	WRITE_ONCE(ctx->sync_state, MD_SYNC_RUNNING);
 
 	if (mm == ctx->key.mm && mm) {
+		bool pte_modified = false;
+
 		for (;;) {
 			unsigned int state;
+			bool this_pte_modified = false;
 
 			mmap_write_lock(mm);
-			memory_delegation_sync_mm(mm, ctx->key.cpu, arena_base);
+			md_memory_delegation_sync_mm(mm, ctx->key.cpu, arena_base,
+						     &this_pte_modified);
 			mmap_write_unlock(mm);
+			pte_modified |= this_pte_modified;
 
 			state = cmpxchg(&ctx->sync_state, MD_SYNC_RUNNING,
 					MD_SYNC_IDLE);
@@ -1378,6 +2107,19 @@ static void md_sync_task_work(struct callback_head *work)
 			stats->pte_sync_cycles += sync_delta;
 			md_stats_add_max(&stats->max_pte_sync_cycles,
 					 sync_delta);
+			if (pte_modified) {
+				stats->pte_sync_modified_calls++;
+				stats->pte_sync_modified_cycles += sync_delta;
+				md_stats_add_max(
+					&stats->max_pte_sync_modified_cycles,
+					sync_delta);
+			} else {
+				stats->pte_sync_unchanged_calls++;
+				stats->pte_sync_unchanged_cycles += sync_delta;
+				md_stats_add_max(
+					&stats->max_pte_sync_unchanged_cycles,
+					sync_delta);
+			}
 			put_cpu_ptr(&md_switch_cycle_stats);
 		}
 #endif
@@ -1525,10 +2267,10 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 	}
 
 	/*
-	 * Android SharedArena creates fresh memfd backing for each creator
-	 * process, but kernel arena metadata is global per CPU.  When the last
+	 * Android SharedArena backing is owned by the system broker, while
+	 * kernel arena metadata remains global per CPU.  When the last
 	 * participating mm has gone away, reset stale ownership/chunk state
-	 * before the next generation starts registering rings.
+	 * before a later generation starts registering rings.
 	 */
 	md_reset_all_arenas_if_idle();
 
@@ -1585,11 +2327,12 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 	bool ctx_switch_sample;
 	u64 stats_start = 0;
 	bool switch_drained_nonempty = false;
+	bool switch_queued_pte_sync = false;
 	struct md_switch_cycle_stats *stats = NULL;
 #endif
 
 	if (prev)
-		prev_mm = prev->mm ? prev->mm : prev->active_mm;
+		prev_mm = prev->mm;
 	prev_active = prev_mm && md_mm_has_active_ctx(prev_mm);
 
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
@@ -1618,7 +2361,8 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 #ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
 				if (unlikely(stats_enabled)) {
 					u64 drain_start = md_read_cycles();
-					bool nonempty = md_drain_log_ring(prev_ctx);
+					bool nonempty = md_drain_log_ring(prev_ctx,
+									 stats);
 					u64 drain_delta = md_read_cycles() -
 						drain_start;
 
@@ -1645,7 +2389,11 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 				} else
 #endif
 				{
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+					md_drain_log_ring(prev_ctx, NULL);
+#else
 					md_drain_log_ring(prev_ctx);
+#endif
 				}
 			}
 
@@ -1686,9 +2434,13 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 			rcu_read_lock();
 			arena = md_get_arena_rcu(cpu);
 			if (arena) {
-				md_queue_sync_if_needed(
-					ctx, next,
-					READ_ONCE(arena->global_commit_seq));
+				if (md_queue_sync_if_needed(
+					    ctx, next,
+					    READ_ONCE(arena->global_commit_seq))) {
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+					switch_queued_pte_sync = true;
+#endif
+				}
 			}
 			rcu_read_unlock();
 			md_mm_ctx_put(ctx);
@@ -1701,11 +2453,15 @@ void memory_delegation_on_context_switch(struct task_struct *prev,
 		stats->ctx_switch_calls++;
 		stats->ctx_switch_cycles += delta;
 		md_stats_add_max(&stats->max_ctx_switch_cycles, delta);
-		if (switch_drained_nonempty) {
+		if (switch_drained_nonempty || switch_queued_pte_sync) {
 			stats->ctx_switch_slow_calls++;
 			stats->ctx_switch_slow_cycles += delta;
 			md_stats_add_max(&stats->max_ctx_switch_slow_cycles,
 					 delta);
+			if (switch_drained_nonempty)
+				stats->ctx_switch_log_slow_calls++;
+			if (switch_queued_pte_sync)
+				stats->ctx_switch_pte_slow_calls++;
 		} else {
 			stats->ctx_switch_fast_calls++;
 			stats->ctx_switch_fast_cycles += delta;
@@ -1769,8 +2525,9 @@ static int md_snapshot_chunk_state(struct mm_struct *mm, unsigned int cpu,
 }
 
 /* 功能：根据 arena 所有权元数据同步修改 mm 的 arena PTE；调用时机：task_work、fork 后或显式内核同步路径调用。 */
-int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
-			      unsigned long arena_base)
+static int md_memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
+					unsigned long arena_base,
+					bool *out_pte_modified)
 {
 	struct md_arena_meta *arena;
 	struct md_mm_ctx *ctx;
@@ -1785,7 +2542,11 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 	bool in_run = false;
 	u32 prefault_run_start = 0;
 	bool in_prefault_run = false;
+	bool pte_modified = false;
 	int ret = 0;
+
+	if (out_pte_modified)
+		*out_pte_modified = false;
 
 	if (!mm || cpu >= nr_cpu_ids || !arena_base)
 		return -EINVAL;
@@ -1831,8 +2592,10 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 				unsigned long end = arena_base +
 					(unsigned long)gap_start * PAGE_SIZE;
 
-				if (end > start)
+				if (end > start) {
 					md_unmap_range_locked(mm, start, end);
+					pte_modified = true;
+				}
 				in_run = false;
 			}
 			if (in_prefault_run) {
@@ -1847,6 +2610,7 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 					ret = md_prefault_range_locked(mm, start, end);
 					if (ret)
 						break;
+					pte_modified = true;
 				}
 				in_prefault_run = false;
 			}
@@ -1872,6 +2636,7 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 				unsigned long end = arena_base +
 					(unsigned long)page * PAGE_SIZE;
 				md_unmap_range_locked(mm, start, end);
+				pte_modified = true;
 				in_run = false;
 			}
 
@@ -1890,6 +2655,7 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 				ret = md_prefault_range_locked(mm, start, end);
 				if (ret)
 					break;
+				pte_modified = true;
 				in_prefault_run = false;
 			}
 		}
@@ -1905,6 +2671,7 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 			(unsigned long)nr_pages * PAGE_SIZE;
 
 		md_unmap_range_locked(mm, start, end);
+		pte_modified = true;
 		in_run = false;
 	}
 
@@ -1915,6 +2682,8 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 			(unsigned long)nr_pages * PAGE_SIZE;
 
 		ret = md_prefault_range_locked(mm, start, end);
+		if (!ret)
+			pte_modified = true;
 		in_prefault_run = false;
 	}
 
@@ -1923,7 +2692,15 @@ int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 
 out_put_ctx:
 	md_mm_ctx_put(ctx);
+	if (!ret && out_pte_modified)
+		*out_pte_modified = pte_modified;
 	return ret;
+}
+
+int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
+			      unsigned long arena_base)
+{
+	return md_memory_delegation_sync_mm(mm, cpu, arena_base, NULL);
 }
 EXPORT_SYMBOL_GPL(memory_delegation_sync_mm);
 
@@ -2006,6 +2783,7 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 	struct md_mm_ctx *ctx;
 	struct hlist_node *tmp;
 	bool had_active_ctx;
+	u64 total_released_pages = 0;
 
 	if (!mm)
 		return;
@@ -2021,61 +2799,161 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 				continue;
 
 			if (READ_ONCE(ctx->arena_base))
+#ifdef CONFIG_MEMORY_DELEGATION_DEBUGFS
+				md_drain_log_ring(ctx, NULL);
+#else
 				md_drain_log_ring(ctx);
+#endif
 			md_mm_ctx_put(ctx);
 		}
 
 		for_each_possible_cpu(cpu) {
 			struct md_arena_meta *arena;
-			unsigned int nr_chunks;
-			u32 chunk;
+			struct md_page_run *runs;
+			struct page *user_lock_page;
+			unsigned long arena_base = 0;
+			u64 cpu_released_pages = 0;
+			u32 nr_pages;
+			u32 run_count = 0;
+			u32 inserted_runs = 0;
+			u32 page;
+			bool in_run = false;
+			u32 run_start = 0;
+			int ret;
 
-			rcu_read_lock();
-			arena = md_get_arena_rcu(cpu);
+			ctx = md_mm_ctx_lookup_get(mm, cpu);
+			if (ctx) {
+				arena_base = READ_ONCE(ctx->arena_base);
+				md_mm_ctx_put(ctx);
+			}
+
+			mutex_lock(&md_arena_table_lock);
+			arena = rcu_dereference_protected(md_arenas[cpu], 1);
 			if (!arena) {
-				rcu_read_unlock();
+				mutex_unlock(&md_arena_table_lock);
 				continue;
 			}
-			nr_chunks = arena->nr_chunks;
+			nr_pages = arena->nr_pages;
 
-			for (chunk = 0; chunk < nr_chunks; chunk++) {
-				u32 start_page = chunk * MD_CHUNK_PAGES;
-				u32 end_page;
-				u32 page;
-				bool dirty = false;
+			runs = kvcalloc(nr_pages, sizeof(*runs), GFP_KERNEL);
+			if (!runs) {
+				mutex_unlock(&md_arena_table_lock);
+				continue;
+			}
 
-				end_page = min_t(u32, arena->nr_pages,
-						 start_page + MD_CHUNK_PAGES);
+			spin_lock(&arena->lock);
+			for (page = 0; page < nr_pages; page++) {
+				if (md_page_belongs_to_mm_locked(arena, page, mm)) {
+					if (!in_run) {
+						in_run = true;
+						run_start = page;
+					}
+					continue;
+				}
 
-				// 清除该mm在当前chunk中的页面所有权记录
+				if (in_run) {
+					runs[run_count].start = run_start;
+					runs[run_count].nr_pages = page - run_start;
+					run_count++;
+					in_run = false;
+				}
+			}
+			if (in_run) {
+				runs[run_count].start = run_start;
+				runs[run_count].nr_pages = nr_pages - run_start;
+				run_count++;
+			}
+			spin_unlock(&arena->lock);
+
+			if (!run_count) {
+				kvfree(runs);
+				mutex_unlock(&md_arena_table_lock);
+				continue;
+			}
+
+			if (!arena_base) {
+				pr_warn_ratelimited(
+					"memory_delegation: mm_release mm=%p cpu=%u has %u owner runs but no arena_base\n",
+					mm, cpu, run_count);
+				kvfree(runs);
+				mutex_unlock(&md_arena_table_lock);
+				continue;
+			}
+
+			ret = md_user_arena_lock(mm, arena_base, &user_lock_page);
+			if (ret) {
+				pr_warn_ratelimited(
+					"memory_delegation: mm_release mm=%p cpu=%u failed to lock userspace arena ret=%d runs=%u\n",
+					mm, cpu, ret, run_count);
+				kvfree(runs);
+				mutex_unlock(&md_arena_table_lock);
+				continue;
+			}
+
+			for (inserted_runs = 0; inserted_runs < run_count;
+			     inserted_runs++) {
+				struct md_page_run *run = &runs[inserted_runs];
+
+				ret = md_user_freelist_insert_locked(mm, arena_base,
+								     run->start,
+								     run->nr_pages);
+				if (ret)
+					break;
+			}
+			md_user_arena_unlock(user_lock_page, arena_base);
+
+			if (ret)
+				pr_warn_ratelimited(
+					"memory_delegation: mm_release mm=%p cpu=%u freelist insert failed ret=%d inserted=%u/%u\n",
+					mm, cpu, ret, inserted_runs, run_count);
+
+			if (inserted_runs) {
+				DECLARE_BITMAP(dirty_chunks, MD_SHARED_ARENA_NR_CHUNKS);
+				u32 run;
+
+				bitmap_zero(dirty_chunks, arena->nr_chunks);
+
 				spin_lock(&arena->lock);
-				for (page = start_page; page < end_page; page++) {
-					u16 slot;
+				for (run = 0; run < inserted_runs; run++) {
+					u32 start_page = runs[run].start;
+					u32 end_page = start_page + runs[run].nr_pages;
 
-					if (!md_page_belongs_to_mm_locked(arena, page, mm))
-						continue;
+					for (page = start_page; page < end_page; page++) {
+						u16 slot;
 
-					slot = arena->page_slot[page];
-					arena->page_slot[page] = MD_INVALID_SLOT;
-					arena->page_free[page] = 0;
-					arena->page_prefault[page] = 0;
-					arena->page_owner_gen[page] = 0;
-					if (slot < arena->owner_slots &&
-					    arena->owner_table[slot].ref_pages)
-						arena->owner_table[slot].ref_pages--;
-					md_put_owner_slot_locked(arena, slot);
-					dirty = true;
+						if (!md_page_belongs_to_mm_locked(arena,
+										  page, mm))
+							continue;
+
+						slot = arena->page_slot[page];
+						arena->page_slot[page] = MD_INVALID_SLOT;
+						arena->page_free[page] = (page == start_page);
+						arena->page_prefault[page] = 0;
+						arena->page_owner_gen[page] = 0;
+						if (slot < arena->owner_slots &&
+						    arena->owner_table[slot].ref_pages)
+							arena->owner_table[slot].ref_pages--;
+						md_put_owner_slot_locked(arena, slot);
+						cpu_released_pages++;
+					}
+					md_mark_dirty_chunks(dirty_chunks, start_page,
+							     end_page);
 				}
-				if (dirty) {
-					u64 commit_seq = ++arena->global_commit_seq;
-
-					WRITE_ONCE(arena->chunk_gen[chunk], commit_seq);
-				}
+				md_commit_dirty_chunks_locked(arena, dirty_chunks);
 				spin_unlock(&arena->lock);
 			}
-			rcu_read_unlock();
+
+			kvfree(runs);
+			mutex_unlock(&md_arena_table_lock);
+			if (cpu_released_pages) {
+				total_released_pages += cpu_released_pages;
+				pr_info_ratelimited(
+					"memory_delegation: mm_release mm=%p cpu=%u released_pages=%llu released_bytes=%llu\n",
+					mm, cpu, cpu_released_pages,
+					cpu_released_pages << PAGE_SHIFT);
+			}
+			}
 		}
-	}
 
 	spin_lock(&md_mm_ctx_table_lock);
 	hash_for_each_safe(md_mm_ctx_table, bkt, tmp, ctx, node) {
@@ -2090,6 +2968,12 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 		md_mm_ctx_put(ctx);
 	}
 	spin_unlock(&md_mm_ctx_table_lock);
+
+	if (had_active_ctx)
+		pr_info_ratelimited(
+			"memory_delegation: mm_release done mm=%p released_pages=%llu released_bytes=%llu\n",
+			mm, total_released_pages,
+			total_released_pages << PAGE_SHIFT);
 }
 EXPORT_SYMBOL_GPL(memory_delegation_mm_release);
 

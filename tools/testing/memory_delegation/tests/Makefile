@@ -5,6 +5,7 @@
 # Outputs:
 #   out/scudo_shared_arena_test
 #   out/scudo_shared_arena_latency_bench
+#   out/memory_delegation_broker
 #
 
 OUT_DIR := $(CURDIR)/out
@@ -36,9 +37,9 @@ endif
 
 CXXFLAGS_COMMON := $(CFLAGS_COMMON) -std=c++17 -fno-exceptions -fno-rtti
 
-.PHONY: all clean scudo_shared_arena_test scudo_shared_arena_latency_bench print-vars
+.PHONY: all clean scudo_shared_arena_test scudo_shared_arena_latency_bench memory_delegation_broker print-vars
 
-all: scudo_shared_arena_test scudo_shared_arena_latency_bench
+all: scudo_shared_arena_test scudo_shared_arena_latency_bench memory_delegation_broker
 
 print-vars:
 	@echo "OUT_DIR=$(OUT_DIR)"
@@ -56,6 +57,7 @@ $(OUT_DIR):
 
 scudo_shared_arena_test: $(OUT_DIR)/scudo_shared_arena_test
 scudo_shared_arena_latency_bench: $(OUT_DIR)/scudo_shared_arena_latency_bench
+memory_delegation_broker: $(OUT_DIR)/memory_delegation_broker
 
 # Scudo standalone allocator + C wrappers.  Keep this source list aligned with
 # standalone/CMakeLists.txt so malloc/free in the smoke binary are Scudo's
@@ -128,6 +130,15 @@ $(OUT_DIR)/scudo_shared_arena_latency_bench: \
 		-o "$@" \
 		"$(SCUDO_DIR)/tests/shared_arena_latency_bench.cpp" \
 		$(SCUDO_BENCH_SRC) \
+		$(LDFLAGS_EXTRA)
+	@file "$@"
+
+$(OUT_DIR)/memory_delegation_broker: \
+		$(SRC_DIR)/memory_delegation_broker.cpp \
+		| $(OUT_DIR)
+	$(CXX) $(CXXFLAGS_COMMON) \
+		-o "$@" \
+		"$(SRC_DIR)/memory_delegation_broker.cpp" \
 		$(LDFLAGS_EXTRA)
 	@file "$@"
 
