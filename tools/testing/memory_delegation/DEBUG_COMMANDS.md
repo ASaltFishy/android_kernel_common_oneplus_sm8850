@@ -141,11 +141,16 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
   "/opt/homebrew/bin/adb wait-for-device"
 ```
 
-直接在手机上运行已 push 的测试二进制：
+直接在手机上运行已 push 的测试二进制。SharedArena Android broker fd 传递需要
+root 上下文，手动运行时也应使用 `su -c`：
 
 ```bash
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
-  "/opt/homebrew/bin/adb shell 'cd /data/local/tmp/md && SCUDO_SHARED_ARENA_FORCE=1 SCUDO_SHARED_ARENA_TRACE=1 SCUDO_SHARED_ARENA_TEST_CPU=0 ./scudo_shared_arena_test'"
+  "/opt/homebrew/bin/adb shell \"su -c 'cd /data/local/tmp/md && \
+    SCUDO_SHARED_ARENA_FORCE=1 \
+    SCUDO_SHARED_ARENA_TRACE=1 \
+    SCUDO_SHARED_ARENA_TEST_CPU=0 \
+    ./scudo_shared_arena_test'\""
 ```
 
 抓 logcat：
@@ -211,59 +216,112 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
             cat /sys/kernel/debug/memory_delegation/chunk_pages\"'"
 ```
 
-跑 `scudo_shared_arena_test` 并统计包含 PTE sync 的内核增量路径：
+跑 `scudo_shared_arena_test` 并统计包含 PTE sync 的内核增量路径。
+注意：Android SharedArena 的 broker fd 传递和 debugfs 读写都应在 root
+上下文下完成，不能只用 root 开关 debugfs、再用普通 adb shell 跑 workload；
+否则测试进程可能拿不到 broker fd，分配回落到普通 VA，数据无效。推荐把脚本
+push 到手机后整体用 `su -c sh ...` 执行，避免 ssh/adb/su 多层引号出错：
 
 ```bash
-OUT=/tmp/md-switch-pte-cycle-stats-$(date +%Y%m%d-%H%M%S).txt
+cat > /tmp/md_run_stats_phone.sh <<'EOS'
+#!/system/bin/sh
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+cd /data/local/tmp/md || exit 1
+
+for p in $(pidof memory_delegation_broker 2>/dev/null) \
+         $(pidof scudo_shared_arena_test 2>/dev/null); do
+  kill -TERM "$p" || true
+done
+sleep 1
+for p in $(pidof memory_delegation_broker 2>/dev/null) \
+         $(pidof scudo_shared_arena_test 2>/dev/null); do
+  kill -KILL "$p" || true
+done
+
+rm -f broker.log switch_pte_cycle_test.out
+./memory_delegation_broker --trace >broker.log 2>&1 &
+for i in $(seq 1 100); do
+  grep -q "ready num_cores=" broker.log && break
+  sleep 0.1
+done
+
+echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats
+echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+SCUDO_SHARED_ARENA_FORCE=1 \
+SCUDO_SHARED_ARENA_TRACE=0 \
+SCUDO_SHARED_ARENA_TEST_CPU=0 \
+SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=20 \
+./scudo_shared_arena_test >switch_pte_cycle_test.out 2>&1
+rc=$?
+cat switch_pte_cycle_test.out
+echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+cat /sys/kernel/debug/memory_delegation/switch_cycle_stats
+exit $rc
+EOS
+
+OUT=/tmp/md-switch-pte-cycle-stats-root-$(date +%Y%m%d-%H%M%S).txt
+scp -q /tmp/md_run_stats_phone.sh lrc@192.168.61.4:/tmp/md_run_stats_phone.sh
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
-  "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
-   'su -c \"echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
-            echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled\"; \
-    cd /data/local/tmp/md && \
-    SCUDO_SHARED_ARENA_FORCE=1 \
-    SCUDO_SHARED_ARENA_TRACE=0 \
-    SCUDO_SHARED_ARENA_TEST_CPU=0 \
-    SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=20 \
-    ./scudo_shared_arena_test >/data/local/tmp/md/switch_pte_cycle_test.out 2>&1; \
-    rc=\$?; \
-    cat /data/local/tmp/md/switch_pte_cycle_test.out; \
-    su -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
-            cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
-    exit \$rc'" | tee "${OUT}"
+  'ADB=/opt/homebrew/bin/adb
+   SERIAL=3B15AL00K5D00000
+   $ADB -s $SERIAL push /tmp/md_run_stats_phone.sh /data/local/tmp/md/md_run_stats_phone.sh >/dev/null
+   $ADB -s $SERIAL shell chmod 755 /data/local/tmp/md/md_run_stats_phone.sh
+   $ADB -s $SERIAL shell su -c "sh /data/local/tmp/md/md_run_stats_phone.sh"' \
+  | tee "${OUT}"
 echo "saved: ${OUT}"
 ```
 
-一次性比较 32/64/128/256/512 页 chunk 的 PTE sync 扫描耗时：
+一次性比较 32/64/128/256/512 页 chunk 的 PTE sync 扫描耗时也应保持同一原则：
+broker、workload 和 debugfs 操作放到同一个 root 脚本里运行。注意只有在
+`active_arenas 0` 的干净状态下写 `chunk_pages` 才会成功；真机 sweep 更推荐
+每个 chunk 配置之间重启手机。
 
 ```bash
 OUT=/tmp/md-chunk-pages-sweep-$(date +%Y%m%d-%H%M%S).txt
 for CHUNK in 32 64 128 256 512; do
+  cat > /tmp/md_chunk_sweep_phone.sh <<EOS
+#!/system/bin/sh
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+cd /data/local/tmp/md || exit 1
+for p in \$(pidof memory_delegation_broker 2>/dev/null) \
+         \$(pidof scudo_shared_arena_test 2>/dev/null); do
+  kill -TERM "\$p" || true
+done
+sleep 1
+for p in \$(pidof memory_delegation_broker 2>/dev/null) \
+         \$(pidof scudo_shared_arena_test 2>/dev/null); do
+  kill -KILL "\$p" || true
+done
+echo ${CHUNK} > /sys/kernel/debug/memory_delegation/chunk_pages || exit \$?
+cat /sys/kernel/debug/memory_delegation/chunk_pages
+rm -f broker.log switch_pte_cycle_test.out
+./memory_delegation_broker --trace >broker.log 2>&1 &
+for i in \$(seq 1 100); do
+  grep -q "ready num_cores=" broker.log && break
+  sleep 0.1
+done
+echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats
+echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+SCUDO_SHARED_ARENA_FORCE=1 \
+SCUDO_SHARED_ARENA_TRACE=0 \
+SCUDO_SHARED_ARENA_TEST_CPU=0 \
+SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=20 \
+./scudo_shared_arena_test >switch_pte_cycle_test.out 2>&1
+rc=\$?
+cat switch_pte_cycle_test.out
+echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+cat /sys/kernel/debug/memory_delegation/switch_cycle_stats
+exit \$rc
+EOS
   echo "===== chunk_pages=${CHUNK} =====" | tee -a "${OUT}"
+  scp -q /tmp/md_chunk_sweep_phone.sh lrc@192.168.61.4:/tmp/md_chunk_sweep_phone.sh
   ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
-    "/opt/homebrew/bin/adb -s 3B15AL00K5D00000 shell \
-     'su -c \"mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
-              for p in \$(pidof memory_delegation_broker 2>/dev/null) \$(pidof scudo_shared_arena_test 2>/dev/null); do kill -TERM \$p || true; done; \
-              sleep 1; \
-              for p in \$(pidof memory_delegation_broker 2>/dev/null) \$(pidof scudo_shared_arena_test 2>/dev/null); do kill -KILL \$p || true; done; \
-              echo ${CHUNK} > /sys/kernel/debug/memory_delegation/chunk_pages; \
-              cat /sys/kernel/debug/memory_delegation/chunk_pages; \
-              echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats; \
-              echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled\"; \
-      cd /data/local/tmp/md && \
-      ./memory_delegation_broker --trace >broker.log 2>&1 & \
-      broker_pid=\$!; \
-      for i in \$(seq 1 100); do grep -q \"ready num_cores=\" broker.log && break; sleep 0.1; done; \
-      SCUDO_SHARED_ARENA_FORCE=1 \
-      SCUDO_SHARED_ARENA_TRACE=0 \
-      SCUDO_SHARED_ARENA_TEST_CPU=0 \
-      SCUDO_SHARED_ARENA_TEST_MAX_ROUNDS=20 \
-      ./scudo_shared_arena_test >/data/local/tmp/md/switch_pte_cycle_test.out 2>&1; \
-      rc=\$?; \
-      cat /data/local/tmp/md/switch_pte_cycle_test.out; \
-      su -c \"echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled; \
-              cat /sys/kernel/debug/memory_delegation/switch_cycle_stats\"; \
-      kill \$broker_pid 2>/dev/null || true; \
-      exit \$rc'" | tee -a "${OUT}"
+    'ADB=/opt/homebrew/bin/adb
+     SERIAL=3B15AL00K5D00000
+     $ADB -s $SERIAL push /tmp/md_chunk_sweep_phone.sh /data/local/tmp/md/md_chunk_sweep_phone.sh >/dev/null
+     $ADB -s $SERIAL shell chmod 755 /data/local/tmp/md/md_chunk_sweep_phone.sh
+     $ADB -s $SERIAL shell su -c "sh /data/local/tmp/md/md_chunk_sweep_phone.sh"' \
+    | tee -a "${OUT}"
 done
 echo "saved: ${OUT}"
 ```

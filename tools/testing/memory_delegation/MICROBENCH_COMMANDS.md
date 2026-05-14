@@ -296,7 +296,7 @@ runner 的 broker 管理逻辑先启动一次：
 ```bash
 cd /home/lrc/patent/kernel/kernel_platform/common
 
-BUILD=1 BUILD_MODE=android START_BROKER=1 \
+BUILD=1 BUILD_MODE=android USE_SU=1 START_BROKER=1 \
 EXTRA_ENV="SCUDO_SHARED_ARENA_TEST_MODE=init_only SCUDO_SHARED_ARENA_TEST_CPU=0" \
 tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
 ```
