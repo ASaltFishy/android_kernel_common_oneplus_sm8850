@@ -12,10 +12,12 @@ enum md_log_op {
 	MD_LOG_FREE = 2,
 };
 
+#define MD_LOG_F_PREFAULT	(1U << 0)
+
 struct md_shadow_log {
 	__u8 op;
 	__u8 src_cpu;	/* arena CPU the pages belong to; set by userspace via rseq */
-	__u16 reserved2;
+	__u16 flags;
 	__u32 start_page;
 	__u32 nr_pages;
 };

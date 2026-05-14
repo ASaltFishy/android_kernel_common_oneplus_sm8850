@@ -1382,6 +1382,15 @@ config MEMORY_DELEGATION
 	  The first version keeps userspace hot paths log-only and uses
 	  generation-based page-table revoke synchronization.
 
+config MEMORY_DELEGATION_DEBUGFS
+	bool "Memory delegation debugfs latency statistics"
+	depends on MEMORY_DELEGATION && DEBUG_FS
+	help
+	  Export memory delegation debug and latency statistics under
+	  /sys/kernel/debug/memory_delegation.  This is intended for
+	  development benchmarking and keeps the measurement code out of
+	  production builds when disabled.
+
 source "mm/damon/Kconfig"
 
 endmenu

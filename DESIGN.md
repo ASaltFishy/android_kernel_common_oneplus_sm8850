@@ -28,7 +28,7 @@
 内存委托必须确保空间隔离与原子性。我们在内核调度层引入协同：
 - 内核独占归属表：分配器为每个 Arena 维护一份仅由内核修改的页面归属表 `page_slot[]`，以页为粒度记录当前页面属于哪个 owner slot；`owner_table` 再将 slot 映射到具体进程地址空间（`mm/tgid`）。其中空闲页用保留 slot 值表示。用户态不直接修改这份真值表，只能通过轻量化日志上报“分配/释放”意图。
 - Chunk 代际追踪：Arena 按固定大小分为多个 chunk（建议 64 页，即约 256KB），内核为每个 chunk 维护 `chunk_gen[u64]`。每次处理完一批用户态上报的分配/释放日志后，内核递增全局提交序号，并把受影响 chunk 的 `chunk_gen` 更新为最新代际号，用于标识该 chunk 自上次同步以来发生过映射变化。
-- 上下文切换时的强制解绑：当该核心发生上下文切换（例如从进程 A 切换到进程 B）时，内核拦截调度路径，先处理 `prev` 进程尚未提交的修改日志并更新 `page_slot[]/chunk_gen[]`，再结合 `next` 进程上次已同步的代际号，只检查发生变化的 chunk。内核据此修改 `next` 的页表，取消其对“已被其他进程拿走的内存块”的映射权限，从而避免应用越权访问或恶意篡改。
+- 上下文切换时的强制解绑：当该核心发生上下文切换（例如从进程 A 切换到进程 B）时，内核拦截调度路径，先处理 `prev` 进程**在本核心上**尚未提交的修改日志并更新arena的 `page_slot[]/chunk_gen[]`（除了本核心arena外，也可能涉及跨核心迁移free的那个arena），再结合 `next` 进程上次已同步的代际号，只检查发生变化的 chunk。内核根据**本arena**中保存的信息修改 `next` 的页表，取消其对“已被其他进程拿走的内存块”的映射权限，从而避免应用越权访问或恶意篡改。
 
 2.4 边界场景处理：跨核与线程迁移
 - 并发访问：由于分配严格绑定在“当前执行核心”的 Arena 上，同一进程的不同线程若运行在不同核心，会分别访问各自核心的 Arena，天然避免了并发访问同一个 Free List 的锁竞争。用户态热路径仅追加本线程或本 Arena 的轻量修改日志，不直接触碰内核真值 `page_slot[]/chunk_gen[]`。
@@ -86,6 +86,17 @@ flowchart LR
   - 安全上下文：在持有 `mmap_write_lock(mm)` 时调用 `memory_delegation_sync_mm()` 执行实际 `unmap`。针对free的页面（注意是bump指针之前的部分）做prefault操作防止用户态分配器访问时触发fault
 - 该约束不改变安全模型，但决定了“撤销映射”的实际触发点必须在可睡眠上下文中。
 
+2.9 memory delegation内核的性能优化
+1. 减少锁使用
+  - arena->lock：由于存在跨核线程迁移，可能同时有多个线程在修改同一arena中的kernel truth、另外修改PTE的时候也要读取
+  - ctx->lock：last_seen_gen 改为 READ_ONCE() / WRITE_ONCE() 无锁访问; sync_queued 改为 READ_ONCE() / WRITE_ONCE() 无锁访问; ring_page：读取侧用 READ_ONCE(ctx->ring_page)发布侧用 cmpxchg(&ctx->ring_page, NULL, page)
+  - md_arena_table_lock：只在arena元数据注册和注销时保护arena全局哈希表使用，不在热路径
+  - md_mm_ctx_table_lock：
+    - 仍用于保护 `md_mm_ctx_table` 的创建、查找加引用、删除以及 `ctx->dead` / `ctx->active` 状态转换，保证 per-(mm,cpu) 上下文生命周期不会在 lookup/get 路径中悬空。
+    - 不再用于 `md_mm_has_active_ctx()` 的热路径查询。`md_active_mm_table` 作为“某个 mm 是否参与 delegation”的快速索引，读侧使用 RCU：`md_mm_has_active_ctx()` 通过 `rcu_read_lock()` + `hash_for_each_possible_rcu()` 查询，避免 context switch、fault、fork、mm_release 前置判断频繁竞争全局 spinlock。
+    - `md_active_mm_table` 的写侧仍在 `md_mm_ctx_table_lock` 内串行化更新；新增记录用 `hash_add_rcu()` 发布，删除记录用 `hash_del_rcu()` 摘链，并通过 `kfree_rcu()` 延迟释放，保证 RCU 读侧看到旧节点时不会产生 use-after-free。
+    - `md_active_mms` 继续作为全局空表 fast-path guard：为 0 时直接跳过 RCU 查表；非 0 时再按 mm 查询 active 记录。该计数只作为快速过滤，不单独表达某个 mm 的活跃状态。
+    - 当前只对 active-mm 查询做 RCU 读侧优化，`md_mm_ctx_lookup_get()` 仍然使用 `md_mm_ctx_table_lock`。若后续将 `md_mm_ctx_table` 也 RCU 化，必须同时引入 RCU 延迟释放和 `refcount_inc_not_zero()`，不能简单把普通 `refcount_inc()` 移到锁外。
 
 ---
 三、 子课题二：智能应用感知的内核层资源协同优化
@@ -110,5 +121,4 @@ flowchart LR
 
 3.4 架构适配建议 (NPU DMA 内存池化)
 - (补充工程落地考量)：针对普通 DMA 映射难以“只释放其中一段连续物理页”的硬件限制，建议在系统层或 LLM 框架侧实现专属的 DMA 内存池 (DMA Memory Pool)。框架预先申请大块 DMA 内存，并在内部按层级管理 KV Cache。当内核下达回收指令时，框架配合解除局部映射，从而保证软硬件在页面粒度上的回收一致性。
-
 
