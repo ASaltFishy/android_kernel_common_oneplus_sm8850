@@ -63,6 +63,11 @@ struct md_switch_cycle_stats {
 	u64 pte_sync_unmap_pages;
 	u64 pte_sync_prefault_ranges;
 	u64 pte_sync_prefault_pages;
+	u64 pte_sync_delta_runs;
+	u64 pte_sync_delta_revoke_runs;
+	u64 pte_sync_delta_prefault_runs;
+	u64 pte_sync_delta_fallbacks;
+	u64 pte_sync_delta_lost_fallbacks;
 	u64 fork_calls;
 	u64 fork_cycles;
 	u64 max_ctx_switch_cycles;
@@ -113,6 +118,11 @@ struct md_pte_sync_detail {
 	u64 unmap_pages;
 	u64 prefault_ranges;
 	u64 prefault_pages;
+	u64 delta_runs;
+	u64 delta_revoke_runs;
+	u64 delta_prefault_runs;
+	u64 delta_fallbacks;
+	u64 delta_lost_fallbacks;
 };
 
 DECLARE_PER_CPU(struct md_switch_cycle_stats, md_switch_cycle_stats);

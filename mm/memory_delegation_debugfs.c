@@ -52,6 +52,11 @@ void md_pte_sync_detail_add(struct md_pte_sync_detail *dst,
 	dst->unmap_pages += src->unmap_pages;
 	dst->prefault_ranges += src->prefault_ranges;
 	dst->prefault_pages += src->prefault_pages;
+	dst->delta_runs += src->delta_runs;
+	dst->delta_revoke_runs += src->delta_revoke_runs;
+	dst->delta_prefault_runs += src->delta_prefault_runs;
+	dst->delta_fallbacks += src->delta_fallbacks;
+	dst->delta_lost_fallbacks += src->delta_lost_fallbacks;
 }
 
 void md_pte_sync_stats_add(struct md_switch_cycle_stats *stats,
@@ -74,6 +79,11 @@ void md_pte_sync_stats_add(struct md_switch_cycle_stats *stats,
 	stats->pte_sync_unmap_pages += detail->unmap_pages;
 	stats->pte_sync_prefault_ranges += detail->prefault_ranges;
 	stats->pte_sync_prefault_pages += detail->prefault_pages;
+	stats->pte_sync_delta_runs += detail->delta_runs;
+	stats->pte_sync_delta_revoke_runs += detail->delta_revoke_runs;
+	stats->pte_sync_delta_prefault_runs += detail->delta_prefault_runs;
+	stats->pte_sync_delta_fallbacks += detail->delta_fallbacks;
+	stats->pte_sync_delta_lost_fallbacks += detail->delta_lost_fallbacks;
 	md_stats_add_max(&stats->max_pte_sync_lock_wait_cycles,
 			 detail->lock_wait_cycles);
 	md_stats_add_max(&stats->max_pte_sync_lock_hold_cycles,
@@ -116,7 +126,7 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 	seq_puts(m, "columns cpu ctx_switch ctx_switch_fast ctx_switch_slow ctx_switch_log_slow ctx_switch_pte_slow drain drain_empty drain_nonempty pte_sync pte_sync_unchanged pte_sync_modified fork avg_ctx_switch avg_ctx_switch_fast avg_ctx_switch_slow avg_drain avg_drain_empty avg_drain_nonempty avg_pte_sync avg_pte_sync_unchanged avg_pte_sync_modified avg_fork max_ctx_switch max_ctx_switch_fast max_ctx_switch_slow max_drain max_drain_empty max_drain_nonempty max_pte_sync max_pte_sync_unchanged max_pte_sync_modified max_fork\n");
 	seq_puts(m, "drain_detail_columns cpu entries alloc_entries free_entries pages alloc_pages free_pages avg_scan avg_lock_wait avg_lock_hold avg_apply avg_apply_alloc avg_apply_free avg_commit max_scan max_lock_wait max_lock_hold max_apply max_apply_alloc max_apply_free max_commit\n");
 	seq_puts(m, "apply_detail_columns cpu avg_alloc_check avg_alloc_update avg_free_check avg_free_update max_alloc_check max_alloc_update max_free_check max_free_update\n");
-	seq_puts(m, "pte_detail_columns cpu dirty_chunks skipped_chunks unmap_ranges unmap_pages prefault_ranges prefault_pages avg_lock_wait avg_lock_hold avg_scan avg_snapshot avg_unmap avg_prefault max_lock_wait max_lock_hold max_scan max_snapshot max_unmap max_prefault\n");
+	seq_puts(m, "pte_detail_columns cpu dirty_chunks skipped_chunks unmap_ranges unmap_pages prefault_ranges prefault_pages delta_runs delta_revoke_runs delta_prefault_runs delta_fallbacks delta_lost_fallbacks avg_lock_wait avg_lock_hold avg_scan avg_snapshot avg_unmap avg_prefault max_lock_wait max_lock_hold max_scan max_snapshot max_unmap max_prefault\n");
 	seq_puts(m, "snapshot_detail_columns cpu avg_lock_wait avg_lock_hold avg_loop max_lock_wait max_lock_hold max_loop\n");
 
 	for_each_possible_cpu(cpu) {
@@ -203,11 +213,16 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 			   s->max_drain_free_check_cycles,
 			   s->max_drain_free_update_cycles);
 		seq_printf(m,
-			   "pte_detail_cpu%u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+			   "pte_detail_cpu%u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
 			   cpu, s->pte_sync_dirty_chunks,
 			   s->pte_sync_skipped_chunks, s->pte_sync_unmap_ranges,
 			   s->pte_sync_unmap_pages, s->pte_sync_prefault_ranges,
 			   s->pte_sync_prefault_pages,
+			   s->pte_sync_delta_runs,
+			   s->pte_sync_delta_revoke_runs,
+			   s->pte_sync_delta_prefault_runs,
+			   s->pte_sync_delta_fallbacks,
+			   s->pte_sync_delta_lost_fallbacks,
 			   md_stats_avg(s->pte_sync_lock_wait_cycles,
 					s->pte_sync_calls),
 			   md_stats_avg(s->pte_sync_lock_hold_cycles,
@@ -297,6 +312,13 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 		sum.pte_sync_unmap_pages += s->pte_sync_unmap_pages;
 		sum.pte_sync_prefault_ranges += s->pte_sync_prefault_ranges;
 		sum.pte_sync_prefault_pages += s->pte_sync_prefault_pages;
+		sum.pte_sync_delta_runs += s->pte_sync_delta_runs;
+		sum.pte_sync_delta_revoke_runs += s->pte_sync_delta_revoke_runs;
+		sum.pte_sync_delta_prefault_runs +=
+			s->pte_sync_delta_prefault_runs;
+		sum.pte_sync_delta_fallbacks += s->pte_sync_delta_fallbacks;
+		sum.pte_sync_delta_lost_fallbacks +=
+			s->pte_sync_delta_lost_fallbacks;
 		sum.fork_calls += s->fork_calls;
 		sum.fork_cycles += s->fork_cycles;
 		md_stats_add_max(&sum.max_ctx_switch_cycles,
@@ -426,10 +448,14 @@ static int md_switch_cycle_stats_show(struct seq_file *m, void *unused)
 		   sum.max_drain_free_check_cycles,
 		   sum.max_drain_free_update_cycles);
 	seq_printf(m,
-		   "pte_detail_total %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+		   "pte_detail_total %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
 		   sum.pte_sync_dirty_chunks, sum.pte_sync_skipped_chunks,
 		   sum.pte_sync_unmap_ranges, sum.pte_sync_unmap_pages,
 		   sum.pte_sync_prefault_ranges, sum.pte_sync_prefault_pages,
+		   sum.pte_sync_delta_runs, sum.pte_sync_delta_revoke_runs,
+		   sum.pte_sync_delta_prefault_runs,
+		   sum.pte_sync_delta_fallbacks,
+		   sum.pte_sync_delta_lost_fallbacks,
 		   md_stats_avg(sum.pte_sync_lock_wait_cycles,
 				sum.pte_sync_calls),
 		   md_stats_avg(sum.pte_sync_lock_hold_cycles,
