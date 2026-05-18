@@ -87,7 +87,17 @@ enum YieldTag {
   YIELD_BEFORE_SEGV_TOUCH,
   YIELD_PARENT_AFTER_FREE,
   YIELD_MIGRATE_FREE,
+  YIELD_EMPTY_SWITCH,
   YIELD_TAG_COUNT,
+};
+
+struct PendingYieldState {
+  volatile uint32_t turn;
+  volatile uint32_t miss;
+  volatile uint32_t index;
+  volatile uint64_t start;
+  volatile uint64_t rejected_alloc;
+  volatile uint64_t rejected_free;
 };
 
 struct YieldTagStats {
@@ -122,9 +132,33 @@ static const char *yield_tag_name(YieldTag tag) {
     return "parent_after_free";
   case YIELD_MIGRATE_FREE:
     return "migrate_free";
+  case YIELD_EMPTY_SWITCH:
+    return "empty_switch";
   default:
     return "unknown";
   }
+}
+
+static void reset_yield_stats(void) {
+  memset(g_yield_stats, 0, sizeof(g_yield_stats));
+}
+
+static void write_text_file_best_effort(const char *path, const char *text) {
+  FILE *fp = fopen(path, "w");
+  if (!fp)
+    return;
+  fputs(text, fp);
+  fclose(fp);
+}
+
+static void reset_kernel_switch_stats_if_requested(void) {
+  if (env_long("SCUDO_SHARED_ARENA_TEST_RESET_KERNEL_STATS_BEFORE_START", 0) == 0)
+    return;
+
+  write_text_file_best_effort(
+      "/sys/kernel/debug/memory_delegation/switch_cycle_stats", "reset\n");
+  write_text_file_best_effort(
+      "/sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled", "1\n");
 }
 
 static inline uint64_t read_test_cycles(void) {
@@ -137,6 +171,39 @@ static inline uint64_t read_test_cycles(void) {
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
+}
+
+static int cmp_u64_sample(const void *a, const void *b) {
+  const uint64_t va = *(const uint64_t *)a;
+  const uint64_t vb = *(const uint64_t *)b;
+  return (va > vb) - (va < vb);
+}
+
+static void print_sample_stats(const char *prefix, const char *name,
+                               uint64_t *samples, int count) {
+  uint64_t sum = 0;
+  uint64_t min = UINT64_MAX;
+  uint64_t max = 0;
+
+  if (count <= 0)
+    return;
+
+  for (int i = 0; i < count; i++) {
+    const uint64_t v = samples[i];
+    sum += v;
+    if (v < min)
+      min = v;
+    if (v > max)
+      max = v;
+  }
+  qsort(samples, (size_t)count, sizeof(*samples), cmp_u64_sample);
+  fprintf(stderr,
+          "%s name=%s count=%d avg=%" PRIu64 " min=%" PRIu64
+          " p50=%" PRIu64 " p90=%" PRIu64 " p99=%" PRIu64
+          " max=%" PRIu64 "\n",
+          prefix, name, count, sum / (uint64_t)count, min,
+          samples[count / 2], samples[(count * 90) / 100],
+          samples[(count * 99) / 100], max);
 }
 
 static void record_yield_sample(YieldTag tag, uint64_t delta, bool first) {
@@ -208,6 +275,43 @@ static void yield_many_tag(int n, YieldTag tag) {
 static void yield_many(int n) {
   yield_many_tag(n, YIELD_GENERIC);
 }
+
+struct EmptyYieldSwitchState {
+  volatile uint32_t turn;
+  volatile uint32_t miss;
+  volatile uint32_t index;
+  volatile uint64_t start;
+  volatile uint64_t rejected;
+};
+
+static uint32_t load_shared_u32(volatile uint32_t *p) {
+  return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static void store_shared_u32(volatile uint32_t *p, uint32_t v) {
+  __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+static bool cmpxchg_shared_u32(volatile uint32_t *p, uint32_t *expected,
+                               uint32_t desired) {
+  return __atomic_compare_exchange_n(p, expected, desired, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static uint64_t load_shared_u64(volatile uint64_t *p) {
+  return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static void store_shared_u64(volatile uint64_t *p, uint64_t v) {
+  __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+static void add_shared_u64(volatile uint64_t *p, uint64_t v) {
+  __atomic_add_fetch(p, v, __ATOMIC_RELAXED);
+}
+
+static void write_full(int fd, const void *buf, size_t n);
+static void read_full(int fd, void *buf, size_t n);
 
 static int g_test_cpu = 0;
 static int g_free_cpu = -1;
@@ -619,6 +723,401 @@ static void run_lifecycle_smoke(void) {
   fprintf(stderr, "PASS(scudo): shared arena lifecycle split/exit ok\n");
 }
 
+static void empty_yield_child_main(int ready_fd, int start_fd, int child_idx,
+                                  int iterations,
+                                  EmptyYieldSwitchState *state,
+                                  uint64_t *samples, bool strict_next) {
+  pin_to_test_cpu();
+
+  const size_t alloc_sz = 32U << 20;
+  void *p = malloc(alloc_sz);
+  if (!p)
+    die("empty_yield child=%d: malloc(%zu) failed", child_idx, alloc_sz);
+  if (!is_in_test_arena(p))
+    die("empty_yield child=%d: malloc VA %p not in expected cpu%d arena",
+        child_idx, p, g_test_cpu);
+
+  // Create and then drain one ownership transition so this mm is an active
+  // arena participant, but the measured phase has no pending log entries.
+  yield_many_tag(80, YIELD_WARMUP);
+  touch_rw(p, alloc_sz);
+  free(p);
+  yield_many_tag(80, YIELD_WARMUP);
+
+  char ready = 'R';
+  write_full(ready_fd, &ready, 1);
+  char start = 0;
+  read_full(start_fd, &start, 1);
+  if (start != 'S')
+    die("empty_yield child=%d: unexpected start byte=%d", child_idx, start);
+
+  reset_yield_stats();
+  if (child_idx == 0) {
+    for (int i = 0; i < iterations; i++) {
+      for (;;) {
+        while (load_shared_u32(&state->turn) != 0)
+          sched_yield();
+        store_shared_u32(&state->index, (uint32_t)i);
+        store_shared_u32(&state->miss, 0);
+        store_shared_u64(&state->start, read_test_cycles());
+        store_shared_u32(&state->turn, 1);
+        sched_yield();
+        if (!strict_next || load_shared_u32(&state->turn) == 0)
+          break;
+        uint32_t expected = 1;
+        if (!cmpxchg_shared_u32(&state->turn, &expected, 3))
+          break;
+        add_shared_u64(&state->rejected, 1);
+      }
+    }
+    while (load_shared_u32(&state->turn) != 0)
+      sched_yield();
+  } else if (child_idx == 1) {
+    for (int accepted = 0; accepted < iterations;) {
+      uint32_t turn = 0;
+      while ((turn = load_shared_u32(&state->turn)) == 0)
+        sched_yield();
+      if (turn == 3) {
+        store_shared_u32(&state->turn, 0);
+        sched_yield();
+        continue;
+      }
+      if (turn != 1)
+        die("empty_yield child=1: unexpected turn=%u", turn);
+      uint32_t expected = 1;
+      if (cmpxchg_shared_u32(&state->turn, &expected, 4)) {
+        const uint64_t delta =
+            read_test_cycles() - load_shared_u64(&state->start);
+        samples[accepted] = delta;
+        record_yield_sample(YIELD_EMPTY_SWITCH, delta, accepted == 0);
+        accepted++;
+        store_shared_u32(&state->turn, 0);
+      }
+      sched_yield();
+    }
+    print_sample_stats("EMPTY_YIELD", "empty_switch", samples, iterations);
+  } else {
+    die("empty_yield child=%d: only child 0/1 are valid", child_idx);
+  }
+  print_yield_stats("empty_child", child_idx);
+  _exit(0);
+}
+
+static void run_empty_yield_smoke(void) {
+  pin_to_test_cpu();
+
+  const int children =
+      (int)env_long("SCUDO_SHARED_ARENA_TEST_EMPTY_CHILDREN", 2);
+  const int iterations =
+      (int)env_long("SCUDO_SHARED_ARENA_TEST_EMPTY_ITERS", 1000);
+  const bool strict_next =
+      env_long("SCUDO_SHARED_ARENA_TEST_STRICT_NEXT", 1) != 0;
+  if (children != 2)
+    die("invalid SCUDO_SHARED_ARENA_TEST_EMPTY_CHILDREN=%d", children);
+  if (iterations <= 0 || iterations > 100000)
+    die("invalid SCUDO_SHARED_ARENA_TEST_EMPTY_ITERS=%d", iterations);
+
+  const size_t state_size =
+      sizeof(EmptyYieldSwitchState) + (size_t)iterations * sizeof(uint64_t);
+  void *mapping = mmap(nullptr, state_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED)
+    die("empty_yield: mmap state failed errno=%d", errno);
+  memset(mapping, 0, state_size);
+
+  EmptyYieldSwitchState *state = (EmptyYieldSwitchState *)mapping;
+  uint64_t *samples = (uint64_t *)(state + 1);
+
+  int ready_pipe[2][2];
+  int start_pipe[2][2];
+  pid_t pids[2];
+
+  for (int i = 0; i < children; i++) {
+    if (pipe(ready_pipe[i]) != 0 || pipe(start_pipe[i]) != 0)
+      die("empty_yield: pipe child=%d failed errno=%d", i, errno);
+  }
+
+  for (int i = 0; i < children; i++) {
+    pid_t pid = fork();
+    if (pid < 0)
+      die("empty_yield: fork child=%d failed errno=%d", i, errno);
+    if (pid == 0) {
+      for (int j = 0; j < children; j++) {
+        if (j == i) {
+          close(ready_pipe[j][0]);
+          close(start_pipe[j][1]);
+          continue;
+        }
+        close(ready_pipe[j][0]);
+        close(ready_pipe[j][1]);
+        close(start_pipe[j][0]);
+        close(start_pipe[j][1]);
+      }
+      empty_yield_child_main(ready_pipe[i][1], start_pipe[i][0], i,
+                             iterations, state, samples, strict_next);
+    }
+
+    pids[i] = pid;
+    close(ready_pipe[i][1]);
+    close(start_pipe[i][0]);
+  }
+
+  for (int i = 0; i < children; i++) {
+    char ready = 0;
+    read_full(ready_pipe[i][0], &ready, 1);
+    close(ready_pipe[i][0]);
+    if (ready != 'R')
+      die("empty_yield: child=%d sent unexpected ready byte=%d", i, ready);
+  }
+
+  reset_kernel_switch_stats_if_requested();
+
+  for (int i = 0; i < children; i++) {
+    char start = 'S';
+    write_full(start_pipe[i][1], &start, 1);
+    close(start_pipe[i][1]);
+  }
+
+  for (int i = 0; i < children; i++) {
+    int st = 0;
+    if (waitpid(pids[i], &st, 0) < 0)
+      die("empty_yield: waitpid child=%d failed errno=%d", i, errno);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+      die("empty_yield: child=%d failed status=%d", i, st);
+  }
+
+  fprintf(stderr,
+          "PASS(scudo): shared arena empty-yield multi-proc ok children=%d iters=%d strict_next=%d rejected=%" PRIu64 "\n",
+          children, iterations, strict_next ? 1 : 0,
+          load_shared_u64(&state->rejected));
+}
+
+static bool issue_pending_yield_turn(PendingYieldState *state, uint32_t turn,
+                                     int index, bool measured,
+                                     bool strict_next,
+                                     volatile uint64_t *rejected) {
+  while (load_shared_u32(&state->turn) != 0)
+    sched_yield();
+  store_shared_u32(&state->index, (uint32_t)index);
+  store_shared_u32(&state->miss, measured ? 0 : 1);
+  store_shared_u64(&state->start, read_test_cycles());
+  store_shared_u32(&state->turn, turn);
+  sched_yield();
+  if (measured && strict_next && load_shared_u32(&state->turn) == turn) {
+    uint32_t expected = turn;
+    if (!cmpxchg_shared_u32(&state->turn, &expected, 3)) {
+      while (load_shared_u32(&state->turn) != 0)
+        sched_yield();
+      return true;
+    }
+    add_shared_u64(rejected, 1);
+    while (load_shared_u32(&state->turn) != 0)
+      sched_yield();
+    return false;
+  }
+  while (load_shared_u32(&state->turn) != 0)
+    sched_yield();
+  return measured;
+}
+
+static void pending_yield_child_main(int ready_fd, int start_fd, int child_idx,
+                                     int iterations, size_t alloc_sz,
+                                     PendingYieldState *state,
+                                     uint64_t *alloc_samples,
+                                     uint64_t *free_samples,
+                                     bool strict_next) {
+  pin_to_test_cpu();
+
+  void *warm = malloc(alloc_sz);
+  if (!warm)
+    die("pending_yield child=%d: warm malloc(%zu) failed", child_idx,
+        alloc_sz);
+  if (!is_in_test_arena(warm))
+    die("pending_yield child=%d: warm malloc VA %p not in expected cpu%d arena",
+        child_idx, warm, g_test_cpu);
+  yield_many_tag(80, YIELD_WARMUP);
+  touch_rw(warm, alloc_sz);
+  free(warm);
+  yield_many_tag(80, YIELD_WARMUP);
+
+  char ready = 'R';
+  write_full(ready_fd, &ready, 1);
+  char start = 0;
+  read_full(start_fd, &start, 1);
+  if (start != 'S')
+    die("pending_yield child=%d: unexpected start byte=%d", child_idx, start);
+
+  if (child_idx == 0) {
+    for (int i = 0; i < iterations; i++) {
+      void *p = nullptr;
+      for (;;) {
+        p = malloc(alloc_sz);
+        if (!p)
+          die("pending_yield: measured malloc(%zu) failed iter=%d", alloc_sz,
+              i);
+        if (!is_in_test_arena(p))
+          die("pending_yield: measured malloc VA %p not in expected cpu%d arena",
+              p, g_test_cpu);
+        if (issue_pending_yield_turn(state, 1, i, true, strict_next,
+                                     &state->rejected_alloc))
+          break;
+        free(p);
+        issue_pending_yield_turn(state, 2, i, false, false,
+                                 &state->rejected_free);
+      }
+
+      for (;;) {
+        free(p);
+        if (issue_pending_yield_turn(state, 2, i, true, strict_next,
+                                     &state->rejected_free))
+          break;
+        p = malloc(alloc_sz);
+        if (!p)
+          die("pending_yield: restore malloc(%zu) failed iter=%d", alloc_sz,
+              i);
+        if (!is_in_test_arena(p))
+          die("pending_yield: restore malloc VA %p not in expected cpu%d arena",
+              p, g_test_cpu);
+        issue_pending_yield_turn(state, 1, i, false, false,
+                                 &state->rejected_alloc);
+      }
+    }
+  } else if (child_idx == 1) {
+    int alloc_accepted = 0;
+    int free_accepted = 0;
+    while (alloc_accepted < iterations || free_accepted < iterations) {
+      uint32_t turn = 0;
+      while ((turn = load_shared_u32(&state->turn)) == 0)
+        sched_yield();
+      if (turn == 3) {
+        store_shared_u32(&state->turn, 0);
+        sched_yield();
+        continue;
+      }
+      if (turn != 1 && turn != 2)
+        die("pending_yield child=1: unexpected turn=%u", turn);
+      uint32_t expected = turn;
+      if (!cmpxchg_shared_u32(&state->turn, &expected, 4))
+        continue;
+      const bool miss = load_shared_u32(&state->miss) != 0;
+      const uint32_t index = load_shared_u32(&state->index);
+      const uint64_t delta = read_test_cycles() - load_shared_u64(&state->start);
+      if (!miss && index < (uint32_t)iterations) {
+        if (turn == 1) {
+          alloc_samples[index] = delta;
+          alloc_accepted++;
+        } else if (turn == 2) {
+          free_samples[index] = delta;
+          free_accepted++;
+        }
+      }
+      store_shared_u32(&state->turn, 0);
+      sched_yield();
+    }
+    print_sample_stats("PENDING_YIELD", "alloc_log_to_next",
+                       alloc_samples, iterations);
+    print_sample_stats("PENDING_YIELD", "free_log_to_next",
+                       free_samples, iterations);
+  } else {
+    die("pending_yield child=%d: only child 0/1 are valid", child_idx);
+  }
+
+  _exit(0);
+}
+
+static void run_pending_sync_yield_bench(void) {
+  pin_to_test_cpu();
+
+  const int children = 2;
+  const int iterations =
+      (int)env_long("SCUDO_SHARED_ARENA_TEST_PENDING_ITERS", 200);
+  const size_t alloc_sz =
+      (size_t)env_long("SCUDO_SHARED_ARENA_TEST_PENDING_SIZE", 32L << 20);
+  const bool strict_next =
+      env_long("SCUDO_SHARED_ARENA_TEST_STRICT_NEXT", 1) != 0;
+  if (iterations <= 0 || iterations > 100000)
+    die("invalid SCUDO_SHARED_ARENA_TEST_PENDING_ITERS=%d", iterations);
+  if (alloc_sz == 0)
+    die("invalid SCUDO_SHARED_ARENA_TEST_PENDING_SIZE=%zu", alloc_sz);
+
+  const size_t state_size = sizeof(PendingYieldState) +
+      (size_t)iterations * sizeof(uint64_t) * 2;
+  void *mapping = mmap(nullptr, state_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED)
+    die("pending_yield: mmap state failed errno=%d", errno);
+  memset(mapping, 0, state_size);
+
+  PendingYieldState *state = (PendingYieldState *)mapping;
+  uint64_t *alloc_samples = (uint64_t *)(state + 1);
+  uint64_t *free_samples = alloc_samples + iterations;
+
+  int ready_pipe[2][2];
+  int start_pipe[2][2];
+  pid_t pids[2];
+
+  for (int i = 0; i < children; i++) {
+    if (pipe(ready_pipe[i]) != 0 || pipe(start_pipe[i]) != 0)
+      die("pending_yield: pipe child=%d failed errno=%d", i, errno);
+  }
+
+  for (int i = 0; i < children; i++) {
+    pid_t pid = fork();
+    if (pid < 0)
+      die("pending_yield: fork child=%d failed errno=%d", i, errno);
+    if (pid == 0) {
+      for (int j = 0; j < children; j++) {
+        if (j == i) {
+          close(ready_pipe[j][0]);
+          close(start_pipe[j][1]);
+          continue;
+        }
+        close(ready_pipe[j][0]);
+        close(ready_pipe[j][1]);
+        close(start_pipe[j][0]);
+        close(start_pipe[j][1]);
+      }
+      pending_yield_child_main(ready_pipe[i][1], start_pipe[i][0], i,
+                               iterations, alloc_sz, state, alloc_samples,
+                               free_samples, strict_next);
+    }
+
+    pids[i] = pid;
+    close(ready_pipe[i][1]);
+    close(start_pipe[i][0]);
+  }
+
+  for (int i = 0; i < children; i++) {
+    char ready = 0;
+    read_full(ready_pipe[i][0], &ready, 1);
+    close(ready_pipe[i][0]);
+    if (ready != 'R')
+      die("pending_yield: child=%d sent unexpected ready byte=%d", i, ready);
+  }
+
+  reset_kernel_switch_stats_if_requested();
+
+  for (int i = 0; i < children; i++) {
+    char start = 'S';
+    write_full(start_pipe[i][1], &start, 1);
+    close(start_pipe[i][1]);
+  }
+
+  for (int i = 0; i < children; i++) {
+    int st = 0;
+    if (waitpid(pids[i], &st, 0) < 0)
+      die("pending_yield: waitpid child=%d failed errno=%d", i, errno);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+      die("pending_yield: child=%d failed status=%d", i, st);
+  }
+
+  fprintf(stderr,
+          "PASS(scudo): shared arena pending-sync yield ok iters=%d size=%zu strict_next=%d rejected_alloc=%" PRIu64 " rejected_free=%" PRIu64 "\n",
+          iterations, alloc_sz, strict_next ? 1 : 0,
+          load_shared_u64(&state->rejected_alloc),
+          load_shared_u64(&state->rejected_free));
+}
+
 static void expect_segv_on_touch(void *p, size_t n) {
   g_saw_segv = 0;
   g_expect_segv_touch = 1;
@@ -795,6 +1294,14 @@ int main(void) {
   }
   if (mode && mode[0] != '\0' && strcmp(mode, "lifecycle") == 0) {
     run_lifecycle_smoke();
+    return 0;
+  }
+  if (mode && mode[0] != '\0' && strcmp(mode, "empty_yield") == 0) {
+    run_empty_yield_smoke();
+    return 0;
+  }
+  if (mode && mode[0] != '\0' && strcmp(mode, "pending_sync_yield") == 0) {
+    run_pending_sync_yield_bench();
     return 0;
   }
 

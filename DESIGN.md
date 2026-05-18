@@ -29,6 +29,7 @@
 - 内核独占归属表：分配器为每个 Arena 维护一份仅由内核修改的页面归属表 `page_slot[]`，以页为粒度记录当前页面属于哪个 owner slot；`owner_table` 再将 slot 映射到具体进程地址空间（`mm/tgid`）。其中空闲页用保留 slot 值表示。用户态不直接修改这份真值表，只能通过轻量化日志上报“分配/释放”意图。
 - Chunk 代际追踪：Arena 按固定大小分为多个 chunk（建议 64 页，即约 256KB），内核为每个 chunk 维护 `chunk_gen[u64]`。每次处理完一批用户态上报的分配/释放日志后，内核递增全局提交序号，并把受影响 chunk 的 `chunk_gen` 更新为最新代际号，用于标识该 chunk 自上次同步以来发生过映射变化。
 - 上下文切换时的强制解绑：当该核心发生上下文切换（例如从进程 A 切换到进程 B）时，内核拦截调度路径，先处理 `prev` 进程**在本核心上**尚未提交的修改日志并更新arena的 `page_slot[]/chunk_gen[]`（除了本核心arena外，也可能涉及跨核心迁移free的那个arena），再结合 `next` 进程上次已同步的代际号，只检查发生变化的 chunk。内核根据**本arena**中保存的信息修改 `next` 的页表，取消其对“已被其他进程拿走的内存块”的映射权限，从而避免应用越权访问或恶意篡改。
+- PTE Delta Run 快路径：当前实现保留 `chunk_gen[]` 作为正确性兜底，但在日志提交时同步记录 bounded delta run ring。`ALLOC` 成功后记录 `REVOKE_NON_OWNER(start,nr_pages,owner_slot,owner_gen)`，`FREE` 成功后只记录释放块首个 freelist 元数据页的 `PREFAULT_FREE`。`memory_delegation_sync_mm()` 在安全上下文中优先按 delta run 直接执行 unmap/prefault，避免对 dirty chunk 做逐页 snapshot；当 delta ring 被覆盖、ctx 过旧或遇到不完整 delta 时，自动回退到 `chunk_gen[]` 扫描慢路径，保证正确性不依赖 delta ring。
 
 2.4 边界场景处理：跨核与线程迁移
 - 并发访问：由于分配严格绑定在“当前执行核心”的 Arena 上，同一进程的不同线程若运行在不同核心，会分别访问各自核心的 Arena，天然避免了并发访问同一个 Free List 的锁竞争。用户态热路径仅追加本线程或本 Arena 的轻量修改日志，不直接触碰内核真值 `page_slot[]/chunk_gen[]`。
@@ -69,8 +70,12 @@ flowchart LR
     A[User Shadow Log] --> B[switch-out prev: drain log]
     B --> C[Kernel Truth: page_slot + owner_table]
     B --> D[chunk_gen + global_commit_seq]
-    D --> E[switch-in next: linear scan chunk_gen]
-    E --> F[unmap unauthorized PTE ranges]
+    B --> R[bounded PTE delta run ring]
+    R --> S{delta retained?}
+    S -- yes --> F[unmap/prefault by delta runs]
+    S -- no --> E[switch-in next: scan chunk_gen fallback]
+    D --> E
+    E --> F
     F --> G[Access fault]
     G --> H[arena_vma_ops->fault]
     H --> I{page_slot[page_idx] == current_slot?}
@@ -85,6 +90,7 @@ flowchart LR
   - 调度路径：仅更新 generation 和标记 `needs_pt_sync`。
   - 安全上下文：在持有 `mmap_write_lock(mm)` 时调用 `memory_delegation_sync_mm()` 执行实际 `unmap`。针对free的页面（注意是bump指针之前的部分）做prefault操作防止用户态分配器访问时触发fault
 - 该约束不改变安全模型，但决定了“撤销映射”的实际触发点必须在可睡眠上下文中。
+- Delta run 快路径同样遵守该约束：调度路径仍只负责 drain log、推进代际和 queue task_work；实际 PTE unmap/prefault 仍在 `memory_delegation_sync_mm()` 持有 `mmap_write_lock(mm)` 后执行。
 
 2.9 memory delegation内核的性能优化
 1. 减少锁使用
@@ -97,6 +103,13 @@ flowchart LR
     - `md_active_mm_table` 的写侧仍在 `md_mm_ctx_table_lock` 内串行化更新；新增记录用 `hash_add_rcu()` 发布，删除记录用 `hash_del_rcu()` 摘链，并通过 `kfree_rcu()` 延迟释放，保证 RCU 读侧看到旧节点时不会产生 use-after-free。
     - `md_active_mms` 继续作为全局空表 fast-path guard：为 0 时直接跳过 RCU 查表；非 0 时再按 mm 查询 active 记录。该计数只作为快速过滤，不单独表达某个 mm 的活跃状态。
     - 当前只对 active-mm 查询做 RCU 读侧优化，`md_mm_ctx_lookup_get()` 仍然使用 `md_mm_ctx_table_lock`。若后续将 `md_mm_ctx_table` 也 RCU 化，必须同时引入 RCU 延迟释放和 `refcount_inc_not_zero()`，不能简单把普通 `refcount_inc()` 移到锁外。
+2. PTE Delta Run Ring 快路径
+  - 目标：解决 `chunk_gen[]` 只能表达“chunk 变过”、无法表达“具体哪些页段需要 PTE 操作”的问题。旧路径在 PTE sync 时需要对 dirty chunk 逐页 snapshot，即使真实修改只是一个连续大块，也要扫描整个 chunk。
+  - 元数据：每个 arena 维护固定容量 `md_pte_delta_run` ring，记录 `serial/seq/op/owner_slot/owner_gen/start_page/nr_pages`。ring 被覆盖时推进 `delta_loss_seq`，使落后的 `ctx->last_seen_gen` 自动回退 chunk 扫描。
+  - 提交语义：同一批 drain 使用即将发布的 `global_commit_seq + 1` 作为 delta `seq`。`ALLOC` 记录 `REVOKE_NON_OWNER`，表示除新 owner 外的 mm 都应撤销这段旧 PTE；`FREE` 不记录 revoke，因为空闲页允许 allocator 访问，只记录首个 freelist header 页的 `PREFAULT_FREE`。
+  - 同步语义：`memory_delegation_sync_mm()` 优先复制 `(last_seen, target_seq]` 内仍保留的 delta run，在释放 arena 锁后批量执行现有 `md_unmap_range_locked()` / `md_prefault_range_locked()`。`REVOKE_NON_OWNER` 在目标 mm 仍是该 run owner 时跳过；`PREFAULT_FREE` 执行前重新校验该页当前仍为 `MD_INVALID_SLOT && page_free`，避免 stale free delta 错误 prefault 已重新分配的页。
+  - 正确性边界：delta ring 只是性能快路径，不是唯一真值。任何内存分配失败、delta 丢失、range 异常或未来出现无法完整生成 delta 的提交路径，都必须回退 `chunk_gen[]` 扫描慢路径。
+  - 当前真机结果：在 4 子进程轮流持有 32 MiB arena 块的 revoke/free workload 中，`pte_sync avg` 从约 `8222 -> 402 cycles`（约 95.1% 优化），`dirty_chunks=0`、`snapshot_loop=0`、`delta_fallbacks=0`。
 
 ---
 三、 子课题二：智能应用感知的内核层资源协同优化

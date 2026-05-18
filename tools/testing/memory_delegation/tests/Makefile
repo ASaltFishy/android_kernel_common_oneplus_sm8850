@@ -21,14 +21,17 @@ AARCH64_CXX ?= aarch64-linux-gnu-g++
 MODE ?= linux
 ANDROID_NDK ?= /home/lrc/patent/kernel/kernel_platform/prebuilts/ndk-r26
 ANDROID_API ?= 34
+ANDROID_CC  ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$(ANDROID_API)-clang
 ANDROID_CXX ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$(ANDROID_API)-clang++
 
 ifeq ($(MODE),android)
+CC := $(ANDROID_CC)
 CXX := $(ANDROID_CXX)
 CFLAGS_COMMON   := -O2 -g -fPIE -pie -pthread -Wall -Wextra -Werror -fno-emulated-tls
 SCUDO_PLATFORM_DEFS :=
 LDFLAGS_EXTRA := -static-libstdc++ -ldl -latomic -llog -landroid
 else
+CC := $(AARCH64_CC)
 CXX := $(AARCH64_CXX)
 CFLAGS_COMMON   := -O2 -g -static -pthread -Wall -Wextra -Werror
 SCUDO_PLATFORM_DEFS := -DSCUDO_LINUX=1 -DSCUDO_ANDROID=0
@@ -37,9 +40,9 @@ endif
 
 CXXFLAGS_COMMON := $(CFLAGS_COMMON) -std=c++17 -fno-exceptions -fno-rtti
 
-.PHONY: all clean scudo_shared_arena_test scudo_shared_arena_latency_bench memory_delegation_broker print-vars
+.PHONY: all clean scudo_shared_arena_test scudo_shared_arena_latency_bench sched_yield_latency_bench memory_delegation_broker print-vars
 
-all: scudo_shared_arena_test scudo_shared_arena_latency_bench memory_delegation_broker
+all: scudo_shared_arena_test scudo_shared_arena_latency_bench sched_yield_latency_bench memory_delegation_broker
 
 print-vars:
 	@echo "OUT_DIR=$(OUT_DIR)"
@@ -49,6 +52,7 @@ print-vars:
 	@echo "AARCH64_CXX=$(AARCH64_CXX)"
 	@echo "MODE=$(MODE)"
 	@echo "ANDROID_NDK=$(ANDROID_NDK)"
+	@echo "ANDROID_CC=$(ANDROID_CC)"
 	@echo "ANDROID_CXX=$(ANDROID_CXX)"
 
 $(OUT_DIR):
@@ -57,6 +61,7 @@ $(OUT_DIR):
 
 scudo_shared_arena_test: $(OUT_DIR)/scudo_shared_arena_test
 scudo_shared_arena_latency_bench: $(OUT_DIR)/scudo_shared_arena_latency_bench
+sched_yield_latency_bench: $(OUT_DIR)/sched_yield_latency_bench
 memory_delegation_broker: $(OUT_DIR)/memory_delegation_broker
 
 # Scudo standalone allocator + C wrappers.  Keep this source list aligned with
@@ -131,6 +136,15 @@ $(OUT_DIR)/scudo_shared_arena_latency_bench: \
 		"$(SCUDO_DIR)/tests/shared_arena_latency_bench.cpp" \
 		$(SCUDO_BENCH_SRC) \
 		$(LDFLAGS_EXTRA)
+	@file "$@"
+
+$(OUT_DIR)/sched_yield_latency_bench: \
+		$(SRC_DIR)/sched_yield_latency_bench.c \
+		| $(OUT_DIR)
+	$(CC) $(CFLAGS_COMMON) \
+		-o "$@" \
+		"$(SRC_DIR)/sched_yield_latency_bench.c" \
+		$(if $(filter android,$(MODE)),-latomic)
 	@file "$@"
 
 $(OUT_DIR)/memory_delegation_broker: \

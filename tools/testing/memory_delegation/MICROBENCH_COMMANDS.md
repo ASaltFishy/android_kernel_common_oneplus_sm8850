@@ -95,6 +95,139 @@ chunk 配置之间重启手机，确认 `chunk_pages` 输出中的 `active_arena
   `MODE=android scudo_shared_arena_latency_bench` 目标已带该宏；Scudo standalone
   的手工 NDK fallback 也应带同样宏。
 
+### 2.0.2 调度 / yield 时延测试口径
+
+当前 yield 测试分成三种互不混淆的口径：
+
+| 场景 | 命令 / mode | 测量对象 | 用途 |
+| --- | --- | --- | --- |
+| baseline | `sched_yield_latency_bench` | 两个普通进程绑同一 CPU，A 写共享状态后 `sched_yield()`，B 返回用户态后记录 A->B 端到端 tick | Linux 调度底噪 |
+| active-empty | `SCUDO_SHARED_ARENA_TEST_MODE=empty_yield` | 两个进程先各自进入 SharedArena active 状态，再测无 pending log / PTE sync 的 A->B 空切换 | 评估 active-mm fast path 是否污染普通切换 |
+| pending-sync | `SCUDO_SHARED_ARENA_TEST_MODE=pending_sync_yield` | child0 每轮 `malloc()` 生成 alloc log 后 yield 给 child1；child1 返回用户态记录 `alloc_log_to_next`。随后 child0 `free()` 生成 free log 后再次 yield 给 child1，记录 `free_log_to_next` | 严格测量“有 pending log / PTE sync”的端到端切换 |
+
+三种口径默认都启用 strict-next 过滤：
+
+- `YIELD_BENCH_STRICT_NEXT=1`：baseline 中 A `sched_yield()` 返回时若 B 还没有清掉 turn，本次 attempt 记为 `rejected` 并重试，不计入样本。
+- `SCUDO_SHARED_ARENA_TEST_STRICT_NEXT=1`：`empty_yield` / `pending_sync_yield` 中执行同样过滤；pending-sync 的 rejected alloc/free attempt 会用不计样本的反向 alloc/free 把 arena 状态恢复后再重试。
+- 若要观察旧的松散 handoff 行为，可显式设为 `0`。
+
+`pending_sync_yield` 的关键输出：
+
+```text
+PENDING_YIELD name=alloc_log_to_next count=... avg=... min=... p50=... p90=... p99=... max=...
+PENDING_YIELD name=free_log_to_next  count=... avg=... min=... p50=... p90=... p99=... max=...
+PASS(scudo): ... strict_next=1 rejected_alloc=... rejected_free=...
+```
+
+配合 debugfs 统计时，`delta_runs/delta_fallbacks/dirty_chunks/snapshot_loop`
+用于确认这轮 PTE sync 是走 delta run 快路径，还是回退到了 chunk 扫描。
+
+手机侧推荐一次性跑三类 yield 测试：
+
+```bash
+cd /home/lrc/patent/kernel/kernel_platform/common
+
+make -C tools/testing/memory_delegation/tests MODE=android clean \
+  sched_yield_latency_bench scudo_shared_arena_test memory_delegation_broker
+
+cat > /tmp/md_yield_latency_phone.sh <<'EOS'
+#!/system/bin/sh
+set -e
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+cd /data/local/tmp/md || exit 1
+
+for p in $(pidof memory_delegation_broker 2>/dev/null) \
+         $(pidof scudo_shared_arena_test 2>/dev/null); do
+  kill -TERM "$p" || true
+done
+sleep 1
+for p in $(pidof memory_delegation_broker 2>/dev/null) \
+         $(pidof scudo_shared_arena_test 2>/dev/null); do
+  kill -KILL "$p" || true
+done
+
+echo "== baseline sched_yield =="
+YIELD_BENCH_CPU=0 \
+YIELD_BENCH_WARMUP=2000 \
+YIELD_BENCH_ITERS=20000 \
+YIELD_BENCH_STRICT_NEXT=1 \
+/data/local/tmp/md/sched_yield_latency_bench
+
+rm -f broker.log
+./memory_delegation_broker --trace >broker.log 2>&1 &
+for i in $(seq 1 100); do
+  grep -q "ready num_cores=" broker.log && break
+  sleep 0.1
+done
+
+echo "== active-empty yield =="
+echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats
+echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+SCUDO_SHARED_ARENA_FORCE=1 \
+SCUDO_SHARED_ARENA_TRACE=0 \
+SCUDO_SHARED_ARENA_TEST_CPU=0 \
+SCUDO_SHARED_ARENA_TEST_MODE=empty_yield \
+SCUDO_SHARED_ARENA_TEST_EMPTY_ITERS=20000 \
+SCUDO_SHARED_ARENA_TEST_YIELD_STATS=1 \
+SCUDO_SHARED_ARENA_TEST_STRICT_NEXT=1 \
+SCUDO_SHARED_ARENA_TEST_RESET_KERNEL_STATS_BEFORE_START=1 \
+./scudo_shared_arena_test
+echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+cat /sys/kernel/debug/memory_delegation/switch_cycle_stats
+
+echo "== pending-sync yield =="
+echo reset > /sys/kernel/debug/memory_delegation/switch_cycle_stats
+echo 1 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+SCUDO_SHARED_ARENA_FORCE=1 \
+SCUDO_SHARED_ARENA_TRACE=0 \
+SCUDO_SHARED_ARENA_TEST_CPU=0 \
+SCUDO_SHARED_ARENA_TEST_MODE=pending_sync_yield \
+SCUDO_SHARED_ARENA_TEST_PENDING_ITERS=200 \
+SCUDO_SHARED_ARENA_TEST_PENDING_SIZE=33554432 \
+SCUDO_SHARED_ARENA_TEST_STRICT_NEXT=1 \
+SCUDO_SHARED_ARENA_TEST_RESET_KERNEL_STATS_BEFORE_START=1 \
+./scudo_shared_arena_test
+echo 0 > /sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+cat /sys/kernel/debug/memory_delegation/switch_cycle_stats
+EOS
+
+OUT=/tmp/md-yield-latency-phone-$(date +%Y%m%d-%H%M%S).txt
+scp -q tools/testing/memory_delegation/tests/out/sched_yield_latency_bench \
+       tools/testing/memory_delegation/tests/out/scudo_shared_arena_test \
+       tools/testing/memory_delegation/tests/out/memory_delegation_broker \
+       /tmp/md_yield_latency_phone.sh \
+       lrc@192.168.61.4:/tmp/
+ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes lrc@192.168.61.4 \
+  'ADB=/opt/homebrew/bin/adb
+   SERIAL=3B15AL00K5D00000
+   $ADB -s $SERIAL shell su -c "mkdir -p /data/local/tmp/md"
+   for f in sched_yield_latency_bench scudo_shared_arena_test memory_delegation_broker md_yield_latency_phone.sh; do
+     $ADB -s $SERIAL push /tmp/$f /data/local/tmp/md/$f >/dev/null
+   done
+   $ADB -s $SERIAL shell su -c "chmod 755 /data/local/tmp/md/sched_yield_latency_bench /data/local/tmp/md/scudo_shared_arena_test /data/local/tmp/md/memory_delegation_broker /data/local/tmp/md/md_yield_latency_phone.sh; sh /data/local/tmp/md/md_yield_latency_phone.sh"' \
+  | tee "${OUT}"
+echo "saved: ${OUT}"
+```
+
+最近一次 delta run 快路径优化后的参考结果：
+
+```text
+baseline:     YIELD_SWITCH avg=2944 p50=2128 p90=5667 p99=8289 max=42970
+active-empty: YIELD_STATS tag=empty_switch count=20000 avg=2981 min=428 max=40462
+
+debugfs pending workload:
+pte_sync avg=402 cycles, max=3028 cycles
+delta_runs=160, delta_fallbacks=0, dirty_chunks=0, snapshot_loop=0
+
+pending-sync smoke:
+alloc_log_to_next avg=2384 p50=2113 p90=4647 p99=6147 max=6147
+free_log_to_next  avg=2291 p50=2182 p90=2275 p99=5846 max=5846
+```
+
+注意：`tools/testing/memory_delegation/tests/out` 是 Linux/QEMU 和 Android
+构建共用输出目录；在两种 `MODE` 之间切换时必须带 `clean`，否则可能把
+Linux 静态 ELF 推到 Android 手机上，表现为 arena VA 判断异常或执行失败。
+
 构建 Android bench：
 
 ```bash
