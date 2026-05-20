@@ -34,14 +34,6 @@ void memory_delegation_mm_release(struct mm_struct *mm);
 int memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 			      unsigned long arena_base);
 
-/*
- * Arena fault policy:
- *  - return true: non-delegation faults or owner still current mm
- *  - return false: registered delegation page is no longer owned by current mm
- */
-bool memory_delegation_fault_allowed(struct mm_struct *mm,
-				     unsigned long address,
-				     const struct vm_area_struct *vma);
 #else
 static inline int memory_delegation_arena_register(unsigned int cpu,
 						   unsigned int nr_pages,
@@ -92,12 +84,6 @@ static inline int memory_delegation_sync_mm(struct mm_struct *mm,
 	return -EOPNOTSUPP;
 }
 
-static inline bool memory_delegation_fault_allowed(struct mm_struct *mm,
-						   unsigned long address,
-						   const struct vm_area_struct *vma)
-{
-	return true;
-}
 #endif
 
 #endif /* _LINUX_MEMORY_DELEGATION_H */

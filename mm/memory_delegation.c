@@ -14,6 +14,7 @@
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
+#include <linux/seqlock.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -94,6 +95,7 @@ struct md_pte_delta_run {
 
 struct md_arena_meta {
 	spinlock_t lock;
+	seqcount_t ownership_seq;
 	u32 nr_pages;
 	u32 nr_chunks;
 	u32 owner_slots;
@@ -332,7 +334,8 @@ static bool md_active_mm_get_locked(struct mm_struct *mm,
 }
 
 /* 功能：将 per-(mm,cpu) ctx 标记为活跃并登记其 mm；调用时机：用户态注册 ring 和 arena 后调用。 */
-static int md_mm_ctx_activate(struct md_mm_ctx *ctx, gfp_t gfp)
+static int md_mm_ctx_activate(struct md_mm_ctx *ctx, u64 initial_last_seen,
+			      gfp_t gfp)
 {
 	struct md_active_mm *new_active;
 	bool activated = false;
@@ -363,6 +366,7 @@ static int md_mm_ctx_activate(struct md_mm_ctx *ctx, gfp_t gfp)
 			kfree(new_active);
 			return -ENOMEM;
 		}
+		WRITE_ONCE(ctx->last_seen_gen, initial_last_seen);
 		ctx->active = true;
 		activated = true;
 	}
@@ -517,6 +521,49 @@ static struct md_vma_wrap *md_vma_wrap_get(const struct vm_area_struct *vma)
 	return (struct md_vma_wrap *)vma->vm_private_data;
 }
 
+/* 功能：打印 arena fault 被拒绝时的 ownership 快照；调用时机：RCU 读侧 fault 权限判断失败时调用。 */
+static void md_log_fault_deny_rcu(const struct vm_area_struct *vma,
+				  const struct md_vma_wrap *wrap,
+				  const struct md_arena_meta *arena,
+				  unsigned long address, u32 page_idx,
+				  u8 slot)
+{
+	struct mm_struct *owner_mm = NULL;
+	u64 global_commit_seq = 0;
+	u32 page_owner_gen = 0;
+	u32 owner_gen = 0;
+	u32 owner_ref_pages = 0;
+	u8 page_free = 0;
+	u8 page_prefault = 0;
+	bool owner_valid = false;
+
+	if (arena && page_idx < arena->nr_pages) {
+		global_commit_seq = READ_ONCE(arena->global_commit_seq);
+		page_owner_gen = READ_ONCE(arena->page_owner_gen[page_idx]);
+		page_free = READ_ONCE(arena->page_free[page_idx]);
+		page_prefault = READ_ONCE(arena->page_prefault[page_idx]);
+		if (slot < arena->owner_slots) {
+			const struct md_owner_entry *owner;
+
+			owner = &arena->owner_table[slot];
+			owner_valid = READ_ONCE(owner->valid);
+			owner_mm = READ_ONCE(owner->mm);
+			owner_gen = READ_ONCE(owner->gen);
+			owner_ref_pages = READ_ONCE(owner->ref_pages);
+		}
+	}
+
+	pr_warn_ratelimited(
+		"memory_delegation: deny arena access pid=%d tgid=%d comm=%s mm=%p addr=0x%lx cpu=%u arena_base=0x%lx page=%u page_off=0x%lx slot=%u page_owner_gen=%u page_free=%u page_prefault=%u owner_valid=%d owner_mm=%p owner_gen=%u owner_ref_pages=%u global_commit_seq=%llu active_mms=%d\n",
+		current->pid, current->tgid, current->comm, vma ? vma->vm_mm : NULL,
+		address, wrap ? wrap->cpu : UINT_MAX,
+		wrap ? wrap->arena_base : 0UL, page_idx,
+		wrap ? address - wrap->arena_base : 0UL, slot, page_owner_gen,
+		page_free, page_prefault, owner_valid, owner_mm, owner_gen,
+		owner_ref_pages, global_commit_seq,
+		atomic_read(&md_active_mms));
+}
+
 /* 功能：判断 wrapped arena VMA 上的 fault 地址是否允许当前 mm 访问；调用时机：arena VMA fault 处理前调用。 */
 static bool md_fault_addr_allowed(const struct vm_area_struct *vma,
 				  unsigned long address)
@@ -550,20 +597,49 @@ static bool md_fault_addr_allowed(const struct vm_area_struct *vma,
 	rcu_read_lock();
 	arena = md_get_arena_rcu(wrap->cpu);
 	if (arena && page_idx < arena->nr_pages) {
-		slot = READ_ONCE(arena->page_slot[page_idx]);
-		/*
-		 * 空闲页（MD_INVALID_SLOT）里存放 SharedArena 的 freelist
-		 * 元数据。允许其 fault 通过，否则一旦空闲页的 PTE
-		 * 被撤销（sync/unmap），用户态在 retrieve/free-list scan
-		 * 时会触发 SIGSEGV。
-		 *
-		 * 仅当页属于“其他 mm 的已分配所有权”时拒绝。
-		 */
-		if (slot == MD_INVALID_SLOT) {
-			allowed = true;
-		} else {
-			allowed = md_page_belongs_to_mm(arena, page_idx, vma->vm_mm);
-		}
+		unsigned int seq;
+
+		do {
+			struct md_owner_entry *owner = NULL;
+			struct mm_struct *owner_mm = NULL;
+			u32 page_owner_gen = 0;
+			u32 owner_gen = 0;
+			bool owner_valid = false;
+
+			seq = read_seqcount_begin(&arena->ownership_seq);
+			slot = READ_ONCE(arena->page_slot[page_idx]);
+			/*
+			 * 空闲页（MD_INVALID_SLOT）里存放 SharedArena 的 freelist
+			 * 元数据。允许其 fault 通过，否则一旦空闲页的 PTE
+			 * 被撤销（sync/unmap），用户态在 retrieve/free-list scan
+			 * 时会触发 SIGSEGV。
+			 *
+			 * 仅当页属于“其他 mm 的已分配所有权”时拒绝。
+			 */
+			if (slot == MD_INVALID_SLOT) {
+				allowed = true;
+				continue;
+			}
+
+			if (slot >= arena->owner_slots) {
+				allowed = false;
+				continue;
+			}
+
+			owner = &arena->owner_table[slot];
+			page_owner_gen = READ_ONCE(arena->page_owner_gen[page_idx]);
+			owner_valid = READ_ONCE(owner->valid);
+			owner_mm = READ_ONCE(owner->mm);
+			owner_gen = READ_ONCE(owner->gen);
+			allowed = owner_valid && owner_mm == vma->vm_mm &&
+				owner_gen == page_owner_gen;
+		} while (read_seqcount_retry(&arena->ownership_seq, seq));
+		if (unlikely(!allowed))
+			md_log_fault_deny_rcu(vma, wrap, arena, address,
+					      page_idx, slot);
+	} else {
+		md_log_fault_deny_rcu(vma, wrap, arena, address, page_idx,
+				      MD_INVALID_SLOT);
 	}
 	rcu_read_unlock();
 
@@ -1441,60 +1517,6 @@ static u64 md_commit_dirty_chunks_locked(struct md_arena_meta *arena,
 	return commit_seq;
 }
 
-/* 功能：清空 arena 内核真值表；调用时机：新一代用户态 backing 首次注册前调用。 */
-static void md_reset_arena_locked(struct md_arena_meta *arena)
-{
-	if (!arena)
-		return;
-
-	lockdep_assert_held(&arena->lock);
-
-	memset(arena->page_slot, MD_INVALID_SLOT, arena->nr_pages);
-	memset(arena->page_free, 0, arena->nr_pages);
-	memset(arena->page_prefault, 0, arena->nr_pages);
-	memset(arena->page_owner_gen, 0,
-	       array_size(arena->nr_pages, sizeof(*arena->page_owner_gen)));
-	memset(arena->chunk_gen, 0,
-	       array_size(arena->nr_chunks, sizeof(*arena->chunk_gen)));
-	memset(arena->owner_table, 0,
-	       array_size(arena->owner_slots, sizeof(*arena->owner_table)));
-	arena->global_commit_seq = 0;
-	arena->delta_next_serial = 1;
-	arena->delta_loss_seq = 0;
-	if (arena->delta_runs)
-		memset(arena->delta_runs, 0,
-		       array_size(MD_PTE_DELTA_RUN_CAPACITY,
-				  sizeof(*arena->delta_runs)));
-}
-
-static void md_reset_all_arenas_if_idle(void)
-{
-	unsigned int cpu;
-
-	if (atomic_read(&md_active_mms))
-		return;
-
-	mutex_lock(&md_arena_table_lock);
-	if (atomic_read(&md_active_mms)) {
-		mutex_unlock(&md_arena_table_lock);
-		return;
-	}
-
-	for_each_possible_cpu(cpu) {
-		struct md_arena_meta *arena;
-
-		arena = rcu_dereference_protected(
-			md_arenas[cpu], lockdep_is_held(&md_arena_table_lock));
-		if (!arena)
-			continue;
-
-		spin_lock(&arena->lock);
-		md_reset_arena_locked(arena);
-		spin_unlock(&arena->lock);
-	}
-	mutex_unlock(&md_arena_table_lock);
-}
-
 /* 功能：消费 ctx 关联的 shadow log ring 并按 src_cpu 分发提交到目标 arena；调用时机：进程切出 CPU 的 context switch 路径调用。 */
 static bool md_drain_log_ring(struct md_mm_ctx *ctx,
 			      struct md_switch_cycle_stats *stats)
@@ -1601,6 +1623,7 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx,
 		MD_TIME_START(lock_hold, "drain_lock_hold");
 		pending_seq = arena->global_commit_seq + 1;
 
+		write_seqcount_begin(&arena->ownership_seq);
 		for (i = head; i != tail; i++) {
 			const struct md_shadow_log *entry =
 				&entries[i % ring->capacity];
@@ -1644,6 +1667,7 @@ static bool md_drain_log_ring(struct md_mm_ctx *ctx,
 		}
 		MD_TIME_START(commit, "drain_commit");
 		md_commit_dirty_chunks_locked(arena, dirty_chunks);
+		write_seqcount_end(&arena->ownership_seq);
 		MD_STATS_ADD_MAX(stats, drain_commit_cycles,
 				 max_drain_commit_cycles, MD_TIME_END(commit));
 		MD_STATS_ADD_MAX(stats, drain_lock_hold_cycles,
@@ -1808,6 +1832,7 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 	arena->owner_slots = owner_slots;
 	arena->delta_next_serial = 1;
 	spin_lock_init(&arena->lock);
+	seqcount_init(&arena->ownership_seq);
 
 	arena->page_slot = kvzalloc(nr_pages, GFP_KERNEL);
 	arena->page_free = kvzalloc(nr_pages, GFP_KERNEL);
@@ -1900,6 +1925,7 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 	u32 nr_pages = 0;
 	int ret;
 	unsigned long prev;
+	u64 initial_last_seen;
 
 	if (cpu >= nr_cpu_ids || !arena_base || !ring_addr)
 		return -EINVAL;
@@ -1917,14 +1943,6 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 		ret = -EINVAL;
 		goto out_put_ctx;
 	}
-
-	/*
-	 * Android SharedArena backing is owned by the system broker, while
-	 * kernel arena metadata remains global per CPU.  When the last
-	 * participating mm has gone away, reset stale ownership/chunk state
-	 * before a later generation starts registering rings.
-	 */
-	md_reset_all_arenas_if_idle();
 
 	/*
 	 * ctx->arena_base is write-once.  After it becomes non-zero it must not
@@ -1946,11 +1964,14 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 	 */
 	if (!ret) {
 		mmap_write_lock(current->mm);
-		ret = md_install_vma_ops(current->mm, cpu, arena_base, arena->nr_pages);
+		ret = md_install_vma_ops(current->mm, cpu, arena_base,
+					 arena->nr_pages);
 		mmap_write_unlock(current->mm);
 	}
-	if (!ret)
-		ret = md_mm_ctx_activate(ctx, GFP_KERNEL);
+	if (!ret) {
+		initial_last_seen = READ_ONCE(arena->global_commit_seq);
+		ret = md_mm_ctx_activate(ctx, initial_last_seen, GFP_KERNEL);
+	}
 out_put_ctx:
 	md_mm_ctx_put(ctx);
 	return ret;
@@ -2879,7 +2900,6 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 				if (ret)
 					break;
 			}
-			md_user_arena_unlock(user_lock_page, arena_base);
 
 			if (ret)
 				pr_warn_ratelimited(
@@ -2896,6 +2916,7 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 				spin_lock(&arena->lock);
 				pending_seq = arena->global_commit_seq + 1;
 
+				write_seqcount_begin(&arena->ownership_seq);
 				for (run = 0; run < inserted_runs; run++) {
 					u32 start_page = runs[run].start;
 					u32 end_page = start_page + runs[run].nr_pages;
@@ -2927,8 +2948,10 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 						start_page, 1);
 				}
 				md_commit_dirty_chunks_locked(arena, dirty_chunks);
+				write_seqcount_end(&arena->ownership_seq);
 				spin_unlock(&arena->lock);
 			}
+			md_user_arena_unlock(user_lock_page, arena_base);
 
 			kvfree(runs);
 			mutex_unlock(&md_arena_table_lock);
@@ -2963,74 +2986,3 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 			total_released_pages << PAGE_SHIFT);
 }
 EXPORT_SYMBOL_GPL(memory_delegation_mm_release);
-
-/* 功能：判断普通 fault 地址是否允许当前 mm 访问 delegation arena 页面；调用时机：通用 fault 路径遇到可能的 arena 地址时调用。 */
-bool memory_delegation_fault_allowed(struct mm_struct *mm,
-				     unsigned long address,
-				     const struct vm_area_struct *vma)
-{
-	unsigned int cpu;
-
-	if (!mm || !vma)
-		return true;
-
-	/* Arena VMA is handled by md_arena_vm_ops->fault. */
-	if (md_vma_is_wrapped(vma))
-		return true;
-
-	/* Fast path: this mm never registered a delegation context. */
-	if (!md_mm_has_active_ctx(mm))
-		return true;
-
-	for_each_possible_cpu(cpu) {
-		struct md_mm_ctx *ctx;
-		struct md_arena_meta *arena;
-		unsigned long arena_base;
-		unsigned long offset;
-		u32 page_idx;
-		bool allowed;
-
-		ctx = md_mm_ctx_lookup_get(mm, cpu);
-		if (!ctx)
-			continue;
-
-		arena_base = READ_ONCE(ctx->arena_base);
-		if (!arena_base || address < arena_base) {
-			md_mm_ctx_put(ctx);
-			continue;
-		}
-
-		rcu_read_lock();
-		arena = md_get_arena_rcu(cpu);
-		if (!arena) {
-			rcu_read_unlock();
-			md_mm_ctx_put(ctx);
-			continue;
-		}
-
-		offset = address - arena_base;
-		page_idx = offset >> PAGE_SHIFT;
-		if (page_idx >= arena->nr_pages) {
-			rcu_read_unlock();
-			md_mm_ctx_put(ctx);
-			continue;
-		}
-
-		/*
-		 * Keep the generic fault hook consistent with md_arena_vm_ops:
-		 * free pages are intentionally accessible because userspace stores
-		 * intrusive freelist metadata there.  Only pages owned by another
-		 * mm should be rejected.
-		 */
-		if (READ_ONCE(arena->page_slot[page_idx]) == MD_INVALID_SLOT)
-			allowed = true;
-		else
-			allowed = md_page_belongs_to_mm(arena, page_idx, mm);
-		rcu_read_unlock();
-		md_mm_ctx_put(ctx);
-		return allowed;
-	}
-
-	return true;
-}
-EXPORT_SYMBOL_GPL(memory_delegation_fault_allowed);
