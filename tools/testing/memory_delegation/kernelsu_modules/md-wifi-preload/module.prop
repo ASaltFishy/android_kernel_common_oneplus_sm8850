@@ -1,0 +1,6 @@
+id=md-wifi-preload
+name=Memory Delegation Wi-Fi Module Preload
+version=1
+versionCode=1
+author=lrc
+description=Preload Wi-Fi dependency modules before Android Wi-Fi HAL starts.
