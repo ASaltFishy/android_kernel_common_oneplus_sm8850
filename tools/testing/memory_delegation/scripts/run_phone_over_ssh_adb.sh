@@ -31,7 +31,7 @@ TESTS_DIR="${BASE_DIR}/tests"
 LOCAL_BIN="${LOCAL_BIN:-${TESTS_DIR}/out/scudo_shared_arena_test}"
 LOCAL_BROKER="${LOCAL_BROKER:-${TESTS_DIR}/out/memory_delegation_broker}"
 
-JUMP_HOST="${JUMP_HOST:-lrc@192.168.61.4}"
+JUMP_HOST="${JUMP_HOST:?JUMP_HOST environment variable must be set (e.g., lrc@192.168.61.230)}"
 ADB_BIN="${ADB_BIN:-/opt/homebrew/bin/adb}"
 ADB_SERIAL="${ADB_SERIAL:-}"
 PHONE_DIR="${PHONE_DIR:-/data/local/tmp/md}"

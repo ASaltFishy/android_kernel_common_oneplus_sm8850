@@ -24,6 +24,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#if defined(__ANDROID__)
+#include <android/sharedmem.h>
+#endif
+
 namespace {
 
 constexpr char kBrokerName[] = "scudo_shared_arena_broker";
@@ -46,6 +50,7 @@ static_assert(sizeof(BrokerReply) == 8, "broker reply ABI drift");
 
 volatile sig_atomic_t StopRequested;
 bool Trace;
+bool UseAshmem;
 
 void trace(const char *Format, ...) {
   if (!Trace)
@@ -111,7 +116,7 @@ bool sendReply(int Sock, int Status, int FdToSend) {
     Cmsg->cmsg_type = SCM_RIGHTS;
     Cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     *reinterpret_cast<int *>(CMSG_DATA(Cmsg)) = FdToSend;
-    Msg.msg_controllen = Cmsg->cmsg_len;
+    Msg.msg_controllen = sizeof(Control);
   }
 
   while (sendmsg(Sock, &Msg, MSG_NOSIGNAL) < 0) {
@@ -123,6 +128,20 @@ bool sendReply(int Sock, int Status, int FdToSend) {
 }
 
 int createArenaBacking(uint32_t CoreId) {
+#if defined(__ANDROID__)
+  if (UseAshmem) {
+    char Name[64];
+    snprintf(Name, sizeof(Name), "scudo_arena_%u", CoreId);
+    const int Fd = ASharedMemory_create(Name, kArenaCapacityPerCore);
+    if (Fd < 0) {
+      trace("ashmem_create core=%u failed errno=%d", CoreId, errno);
+      return -1;
+    }
+    trace("created ashmem core=%u fd=%d", CoreId, Fd);
+    return Fd;
+  }
+#endif
+
 #if defined(SYS_memfd_create)
   char Name[64];
   snprintf(Name, sizeof(Name), "scudo_arena_%u", CoreId);
@@ -167,9 +186,10 @@ bool parseU32(const char *Text, uint32_t &Out) {
 
 void usage(const char *Argv0) {
   fprintf(stderr,
-          "usage: %s [--num-cores N] [--trace]\n"
+          "usage: %s [--num-cores N] [--trace] [--ashmem]\n"
           "  --num-cores N  number of arena fds to create (1..%u)\n"
-          "  --trace        print broker events to stderr\n",
+          "  --trace        print broker events to stderr\n"
+          "  --ashmem       use Android ASharedMemory backing instead of memfd\n",
           Argv0, kArenaMaxCores);
 }
 
@@ -181,6 +201,10 @@ int main(int argc, char **argv) {
   for (int I = 1; I < argc; ++I) {
     if (strcmp(argv[I], "--trace") == 0) {
       Trace = true;
+      continue;
+    }
+    if (strcmp(argv[I], "--ashmem") == 0) {
+      UseAshmem = true;
       continue;
     }
     if (strcmp(argv[I], "--num-cores") == 0 && I + 1 < argc) {
