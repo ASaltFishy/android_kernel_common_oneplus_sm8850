@@ -1,0 +1,6 @@
+id=md-camera-scudo
+name=Memory Delegation Camera Scudo Probe
+version=v0.1
+versionCode=1
+author=lrc
+description=Systemless probe that preloads modified Scudo into com.oplus.camera via wrap property.

@@ -44,7 +44,7 @@ need aarch64-linux-gnu-g++
 [[ -f "${BUSYBOX}" ]] || die "BUSYBOX not found: ${BUSYBOX}"
 
 echo "== Build test binaries (Makefile) =="
-make -C "${TESTS_DIR}" clean all
+make -C "${TESTS_DIR}" clean scudo_shared_arena_test
 
 SCUDO_TEST_BIN="${TESTS_DIR}/out/scudo_shared_arena_test"
 

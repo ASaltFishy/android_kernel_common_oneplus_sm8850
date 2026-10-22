@@ -3,12 +3,17 @@
 本文档是 memory delegation 的统一命令入口，合并原
 `DEBUG_COMMANDS.md` 和 `MICROBENCH_COMMANDS.md` 中仍然常用的内容。
 
+脚本按用途分类见 [scripts/README.md](scripts/README.md)；相机连拍和 allocator
+trace 实验说明见
+[CAMERA_CONTINUOUS_SHOOTING.md](scripts/camera_continuous_shooting/CAMERA_CONTINUOUS_SHOOTING.md)。
+KernelSU 模块与 Scudo overlay 脚本位于 `scripts/kernelsu/`。
+
 约定：
 
 ```bash
 cd /home/lrc/patent/kernel/kernel_platform/common
-JUMP_HOST=lrc@192.168.61.230
-ADB_BIN=/opt/homebrew/bin/adb
+export ADB_SERVER_SOCKET=tcp:127.0.0.1:15037
+ADB_BIN=adb
 ADB_SERIAL=3B15AL00K5D00000
 PHONE_DIR=/data/local/tmp/md
 ```
@@ -27,11 +32,24 @@ tools/bazel run //common:kernel_aarch64_dist -- --destdir=./out
 ~/patent/flush_kernel.sh --mode flash
 ```
 
-检查跳板机 adb：
+手机通过 Mac 上的 adb server 反向转发到服务器本机
+`127.0.0.1:15037`。Mac 侧保持如下隧道在线：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$JUMP_HOST" \
-  "$ADB_BIN devices -l && $ADB_BIN -s $ADB_SERIAL shell getprop sys.boot_completed"
+adb start-server
+ssh -N \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes \
+  -R 127.0.0.1:15037:127.0.0.1:5037 \
+  lrc-ubuntu
+```
+
+检查服务器本机 adb：
+
+```bash
+$ADB_BIN devices -l
+$ADB_BIN -s "$ADB_SERIAL" shell getprop sys.boot_completed
 ```
 
 构建 Android 测试二进制：
@@ -70,18 +88,17 @@ PASS(scudo): shared arena retrieve/store ok
 查看 broker / kernel 日志：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$JUMP_HOST" \
-  "$ADB_BIN -s $ADB_SERIAL shell su -c 'cat /data/local/tmp/md/broker.log 2>/dev/null | tail -n 80; dmesg | tail -n 120'"
+$ADB_BIN -s "$ADB_SERIAL" shell su -c \
+  'cat /data/local/tmp/md/broker.log 2>/dev/null | tail -n 80; dmesg | tail -n 120'
 ```
 
 手机重启或 adb 断开后：
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$JUMP_HOST" \
-  "$ADB_BIN -s $ADB_SERIAL wait-for-device; \
-   $ADB_BIN -s $ADB_SERIAL shell getprop sys.boot.reason; \
-   $ADB_BIN -s $ADB_SERIAL shell getprop ro.boot.bootreason; \
-   $ADB_BIN -s $ADB_SERIAL shell su -c 'ls -la /sys/fs/pstore 2>/dev/null || true'"
+$ADB_BIN -s "$ADB_SERIAL" wait-for-device
+$ADB_BIN -s "$ADB_SERIAL" shell getprop sys.boot.reason
+$ADB_BIN -s "$ADB_SERIAL" shell getprop ro.boot.bootreason
+$ADB_BIN -s "$ADB_SERIAL" shell su -c 'ls -la /sys/fs/pstore 2>/dev/null || true'
 ```
 
 ## 2. QEMU 简单验证
@@ -169,22 +186,16 @@ tools/testing/memory_delegation/scripts/phone/run_yield_latency_phone.sh
 ```bash
 OUT=/tmp/md-yield-latency-phone-$(date +%Y%m%d-%H%M%S).txt
 
-scp -q \
-  tools/testing/memory_delegation/tests/out/sched_yield_latency_bench \
-  tools/testing/memory_delegation/tests/out/scudo_shared_arena_test \
-  tools/testing/memory_delegation/tests/out/memory_delegation_broker \
+$ADB_BIN -s "$ADB_SERIAL" shell su -c "mkdir -p $PHONE_DIR"
+for f in sched_yield_latency_bench scudo_shared_arena_test memory_delegation_broker; do
+  $ADB_BIN -s "$ADB_SERIAL" push "tools/testing/memory_delegation/tests/out/$f" "$PHONE_DIR/$f" >/dev/null
+done
+$ADB_BIN -s "$ADB_SERIAL" push \
   tools/testing/memory_delegation/scripts/phone/run_yield_latency_phone.sh \
-  "$JUMP_HOST:/tmp/"
-
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$JUMP_HOST" \
-  "ADB_BIN=$ADB_BIN ADB_SERIAL=$ADB_SERIAL PHONE_DIR=$PHONE_DIR bash -lc '
-   adb_cmd=(\"\$ADB_BIN\"); [[ -n \"\$ADB_SERIAL\" ]] && adb_cmd+=( -s \"\$ADB_SERIAL\" )
-   \"\${adb_cmd[@]}\" shell su -c \"mkdir -p \$PHONE_DIR\"
-   for f in sched_yield_latency_bench scudo_shared_arena_test memory_delegation_broker run_yield_latency_phone.sh; do
-     \"\${adb_cmd[@]}\" push /tmp/\$f \$PHONE_DIR/\$f >/dev/null
-   done
-   \"\${adb_cmd[@]}\" shell su -c \"cd \$PHONE_DIR && chmod 755 sched_yield_latency_bench scudo_shared_arena_test memory_delegation_broker run_yield_latency_phone.sh && CPU=0 sh ./run_yield_latency_phone.sh\"
-  '" | tee "$OUT"
+  "$PHONE_DIR/run_yield_latency_phone.sh" >/dev/null
+$ADB_BIN -s "$ADB_SERIAL" shell su -c \
+  "cd $PHONE_DIR && chmod 755 sched_yield_latency_bench scudo_shared_arena_test memory_delegation_broker run_yield_latency_phone.sh && CPU=0 sh ./run_yield_latency_phone.sh" \
+  | tee "$OUT"
 echo "saved: $OUT"
 ```
 
@@ -229,7 +240,6 @@ make -C tools/testing/memory_delegation/tests MODE=android clean \
 
 ```bash
 python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py \
-  --remote-host "$JUMP_HOST" \
   --use-su \
   --skip-build \
   --binary /home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench \
@@ -251,7 +261,6 @@ python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_are
 
 ```bash
 python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py \
-  --remote-host "$JUMP_HOST" \
   --use-su \
   --skip-build \
   --binary /home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench \
@@ -283,7 +292,6 @@ independent-process_*_speedup_*.png
 
 ```bash
 python3 /home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone/run_shared_arena_microbench.py \
-  --remote-host "$JUMP_HOST" \
   --use-su \
   --skip-build \
   --binary /home/lrc/patent/kernel/kernel_platform/common/tools/testing/memory_delegation/tests/out/scudo_shared_arena_latency_bench \

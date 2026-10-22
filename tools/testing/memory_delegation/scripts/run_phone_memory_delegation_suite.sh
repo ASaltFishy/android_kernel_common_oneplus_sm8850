@@ -4,8 +4,8 @@
 # Staged physical-phone smoke suite for memory delegation.
 #
 # It reuses run_phone_over_ssh_adb.sh and intentionally runs from low-risk
-# wiring checks to the full revoke/fault path. Override JUMP_HOST/ADB_SERIAL/
-# USE_SU/PHONE_DIR/WAIT_SECS exactly as with the underlying runner.
+# wiring checks to the full revoke/fault path. Override ADB_SERVER_SOCKET/
+# ADB_SERIAL/USE_SU/PHONE_DIR/WAIT_SECS exactly as with the underlying runner.
 
 set -euo pipefail
 

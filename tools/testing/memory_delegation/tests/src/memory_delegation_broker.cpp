@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -135,6 +136,11 @@ int createArenaBacking(uint32_t CoreId) {
     const int Fd = ASharedMemory_create(Name, kArenaCapacityPerCore);
     if (Fd < 0) {
       trace("ashmem_create core=%u failed errno=%d", CoreId, errno);
+      return -1;
+    }
+    if (ASharedMemory_setProt(Fd, PROT_READ | PROT_WRITE) != 0) {
+      trace("ashmem_set_prot core=%u failed errno=%d", CoreId, errno);
+      close(Fd);
       return -1;
     }
     trace("created ashmem core=%u fd=%d", CoreId, Fd);

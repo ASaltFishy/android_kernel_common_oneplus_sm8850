@@ -2,17 +2,17 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 # Run memory_delegation userspace tests on a physical phone via:
-#   host -> ssh jump box -> adb -> phone
+#   host adb client -> reverse-forwarded adb server -> phone
 #
 # Default assumptions:
-# - The jump box has working `adb` access to the phone.
+# - ADB_SERVER_SOCKET points at the reverse-forwarded adb server.
 # - The phone can execute the pushed test binary (aarch64).
 #
 # Usage:
 #   common/tools/testing/memory_delegation/scripts/run_phone_over_ssh_adb.sh
 #
 # Knobs:
-#   JUMP_HOST=lrc@192.168.60.205   (ssh target)
+#   ADB_SERVER_SOCKET=tcp:127.0.0.1:15037
 #   ADB_SERIAL=...                 (optional: specific device)
 #   PHONE_DIR=/data/local/tmp/md   (remote dir on phone)
 #   USE_SU=1                       (run test under `su -c ...`)
@@ -31,8 +31,8 @@ TESTS_DIR="${BASE_DIR}/tests"
 LOCAL_BIN="${LOCAL_BIN:-${TESTS_DIR}/out/scudo_shared_arena_test}"
 LOCAL_BROKER="${LOCAL_BROKER:-${TESTS_DIR}/out/memory_delegation_broker}"
 
-JUMP_HOST="${JUMP_HOST:?JUMP_HOST environment variable must be set (e.g., lrc@192.168.61.230)}"
-ADB_BIN="${ADB_BIN:-/opt/homebrew/bin/adb}"
+ADB_SERVER_SOCKET="${ADB_SERVER_SOCKET:-tcp:127.0.0.1:15037}"
+ADB_BIN="${ADB_BIN:-adb}"
 ADB_SERIAL="${ADB_SERIAL:-}"
 PHONE_DIR="${PHONE_DIR:-/data/local/tmp/md}"
 USE_SU="${USE_SU:-0}"
@@ -58,12 +58,9 @@ OUT_LOGCAT="${OUT_LOGCAT:-${OUT_PREFIX}.logcat.txt}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
-need ssh
-need scp
+need "${ADB_BIN}"
 
-# Non-interactive SSH: accept first-time host keys automatically.
-# You can override via `SSH_OPTS=...` if you want stricter behavior.
-SSH_OPTS="${SSH_OPTS:-"-o StrictHostKeyChecking=accept-new -o BatchMode=yes"}"
+export ADB_SERVER_SOCKET
 
 if [[ "${BUILD}" == "1" ]]; then
   need make
@@ -76,20 +73,18 @@ if [[ "${START_BROKER}" == "1" ]]; then
   [[ -f "${LOCAL_BROKER}" ]] || die "broker binary not found: ${LOCAL_BROKER} (set LOCAL_BROKER=... or BUILD=1)"
 fi
 
-REMOTE_TMP="md-phone-${STAMP}"
-REMOTE_DIR="~/tmp/${REMOTE_TMP}"
+REMOTE_DIR="${WORKDIR}/md-phone-${STAMP}"
 
-echo "== Upload binary to jump box =="
-ssh ${SSH_OPTS} "${JUMP_HOST}" "mkdir -p ${REMOTE_DIR}"
-scp ${SSH_OPTS} -p "${LOCAL_BIN}" "${JUMP_HOST}:${REMOTE_DIR}/scudo_shared_arena_test"
+echo "== Stage local artifacts =="
+mkdir -p "${REMOTE_DIR}"
+cp -p "${LOCAL_BIN}" "${REMOTE_DIR}/scudo_shared_arena_test"
 if [[ "${START_BROKER}" == "1" ]]; then
-  scp ${SSH_OPTS} -p "${LOCAL_BROKER}" "${JUMP_HOST}:${REMOTE_DIR}/memory_delegation_broker"
+  cp -p "${LOCAL_BROKER}" "${REMOTE_DIR}/memory_delegation_broker"
 fi
 
-echo "== Run via adb on jump box =="
+echo "== Run via adb (ADB_SERVER_SOCKET=${ADB_SERVER_SOCKET}) =="
 set +e
-ssh ${SSH_OPTS} "${JUMP_HOST}" \
-  "REMOTE_TMP=${REMOTE_TMP@Q} PHONE_DIR=${PHONE_DIR@Q} ADB_SERIAL=${ADB_SERIAL@Q} USE_SU=${USE_SU@Q} ADB_BIN=${ADB_BIN@Q} EXTRA_ENV=${EXTRA_ENV@Q} CLEAR_LOGCAT=${CLEAR_LOGCAT@Q} WAIT_SECS=${WAIT_SECS@Q} WAIT_BOOT_COMPLETED=${WAIT_BOOT_COMPLETED@Q} START_BROKER=${START_BROKER@Q} KILL_STALE_BROKER=${KILL_STALE_BROKER@Q} WAIT_BROKER_SECS=${WAIT_BROKER_SECS@Q} bash -s" <<'EOF' 2>&1 | tee "${OUT_LOG}"
+REMOTE_DIR=${REMOTE_DIR@Q} PHONE_DIR=${PHONE_DIR@Q} ADB_SERIAL=${ADB_SERIAL@Q} USE_SU=${USE_SU@Q} ADB_BIN=${ADB_BIN@Q} EXTRA_ENV=${EXTRA_ENV@Q} CLEAR_LOGCAT=${CLEAR_LOGCAT@Q} WAIT_SECS=${WAIT_SECS@Q} WAIT_BOOT_COMPLETED=${WAIT_BOOT_COMPLETED@Q} START_BROKER=${START_BROKER@Q} KILL_STALE_BROKER=${KILL_STALE_BROKER@Q} WAIT_BROKER_SECS=${WAIT_BROKER_SECS@Q} bash -s <<'EOF' 2>&1 | tee "${OUT_LOG}"
 set -euo pipefail
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
 need sed
@@ -118,10 +113,8 @@ run_timeout() {
   ' "${secs}" "$@"
 }
 
-REMOTE_DIR="${HOME}/tmp/${REMOTE_TMP}"
-
 adb_path=""
-if [[ -n "${ADB_BIN}" && -x "${ADB_BIN}" ]]; then
+if [[ -n "${ADB_BIN}" ]] && command -v "${ADB_BIN}" >/dev/null 2>&1; then
   adb_path="${ADB_BIN}"
 else
   adb_path="$(command -v adb || true)"
@@ -247,8 +240,7 @@ run_rc=${PIPESTATUS[0]}
 set -e
 
 echo "== Save full dmesg/logcat locally =="
-ssh ${SSH_OPTS} "${JUMP_HOST}" \
-  "ADB_SERIAL=${ADB_SERIAL@Q} USE_SU=${USE_SU@Q} ADB_BIN=${ADB_BIN@Q} bash -s" <<'EOF' > "${OUT_DMESG}"
+ADB_SERIAL=${ADB_SERIAL@Q} USE_SU=${USE_SU@Q} ADB_BIN=${ADB_BIN@Q} bash -s <<'EOF' > "${OUT_DMESG}"
 set -euo pipefail
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
 need perl
@@ -277,7 +269,7 @@ run_timeout() {
 }
 
 adb_path=""
-if [[ -n "${ADB_BIN}" && -x "${ADB_BIN}" ]]; then
+if [[ -n "${ADB_BIN}" ]] && command -v "${ADB_BIN}" >/dev/null 2>&1; then
   adb_path="${ADB_BIN}"
 else
   adb_path="$(command -v adb || true)"
@@ -296,8 +288,7 @@ else
 fi
 EOF
 
-ssh ${SSH_OPTS} "${JUMP_HOST}" \
-  "ADB_SERIAL=${ADB_SERIAL@Q} ADB_BIN=${ADB_BIN@Q} bash -s" <<'EOF' > "${OUT_LOGCAT}"
+ADB_SERIAL=${ADB_SERIAL@Q} ADB_BIN=${ADB_BIN@Q} bash -s <<'EOF' > "${OUT_LOGCAT}"
 set -euo pipefail
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
 need perl
@@ -326,7 +317,7 @@ run_timeout() {
 }
 
 adb_path=""
-if [[ -n "${ADB_BIN}" && -x "${ADB_BIN}" ]]; then
+if [[ -n "${ADB_BIN}" ]] && command -v "${ADB_BIN}" >/dev/null 2>&1; then
   adb_path="${ADB_BIN}"
 else
   adb_path="$(command -v adb || true)"

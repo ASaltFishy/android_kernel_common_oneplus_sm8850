@@ -1,0 +1,6 @@
+id=md-system-scudo
+name=Memory Delegation System Scudo Probe
+version=v0.1
+versionCode=1
+author=lrc
+description=Disabled-by-default KernelSU module for testing Scudo as bionic malloc_debug replacement.
