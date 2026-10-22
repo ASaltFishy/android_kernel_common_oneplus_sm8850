@@ -2480,17 +2480,18 @@ static long prctl_set_memory_delegation_log(unsigned long arg2,
 					    unsigned long arg4,
 					    unsigned long arg5)
 {
-	unsigned int nr_entries = arg3;
+	unsigned long flags = arg3;
 	unsigned int cpu = arg4;
 	unsigned long arena_base = arg5;
 
 	if (!arena_base)
 		return -EINVAL;
 
-	if (!nr_entries)
-		return memory_delegation_register_ring(cpu, arena_base, arg2);
+	/* Explicit drain is retired: only the owner CPU scheduler consumes. */
+	if (flags & PR_MEMORY_DELEGATION_F_DRAIN_LOG)
+		return -EOPNOTSUPP;
 
-	return -EOPNOTSUPP;
+	return memory_delegation_register_ring(cpu, arena_base, arg2, flags);
 }
 
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,

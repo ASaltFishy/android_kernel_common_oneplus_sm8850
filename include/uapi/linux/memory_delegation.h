@@ -43,8 +43,78 @@ struct md_log_ring {
 	__u32 head;
 	__u32 tail;
 	__u32 dropped;
-	__u32 reserved;
+	__u32 last_error;	/* positive errno from the last rejected record */
 	struct md_shadow_log entries[];
+};
+
+
+/*
+ * Shared Arena log ABI v2. Old per-mm rings are intentionally not compatible.
+ * All u64 fields are naturally aligned, including in 32-bit userspace.
+ * log storage is MAP_SHARED shmem outside payload, held by the broker. Both
+ * queues use capacity slots: normal first, remote FREE second.
+ */
+#define MD_SHARED_LOG_MAGIC 0x4d445332U
+#define MD_SHARED_LOG_VERSION 2U
+#define MD_SHARED_LOG_MAX_PAGES 256U
+#define MD_SHARED_LOG_RUNNING 0U
+#define MD_SHARED_LOG_STOPPED 1U
+#define MD_SHARED_LOG_F_INTRUSIVE (1U << 0)
+
+struct md_shared_record {
+	__aligned_u64 session;
+	__aligned_u64 block_id;
+	__aligned_u64 generation;
+	/* Unique, strictly increasing per-Arena ALLOC serial under Arena Mutex. */
+	__aligned_u64 allocation_id;
+	__u32 start_page;
+	__u32 nr_pages;
+	__u16 cpu;
+	__u8 op;
+	__u8 flags;
+	__u32 reserved;
+};
+
+struct md_shared_slot {
+	/* Producer release-publishes ticket + 1 AFTER writing record. */
+	__aligned_u64 ready;
+	struct md_shared_record record;
+	/* Kernel writes result, then release-publishes queue completed. */
+	__s32 result; /* 0 or negative errno; never inferred from completed alone */
+	__u32 reserved;
+};
+
+struct md_shared_queue {
+	/* normal: release tail; remote: CAS reservation, NOT publication */
+	__aligned_u64 reserved;
+	/* Kernel output only. Records/results retained until reclaimed. */
+	__aligned_u64 completed;
+	/* Owner-CPU user consumer release-publishes after processing results. */
+	__aligned_u64 reclaimed;
+};
+
+struct md_shared_log {
+	__u32 magic;
+	__u16 version;
+	__u16 flags;
+	__u32 capacity; /* immutable; each queue has this many slots */
+	__u32 arena_nr_pages;
+	__u32 log_bytes;
+	__u32 state; /* broker stops all producers BEFORE publishing STOPPED */
+	struct md_shared_queue normal;
+	struct md_shared_queue remote;
+	struct md_shared_slot slots[];
+};
+
+/* prctl arg2 points here with F_EXTERNAL_BACKEND | F_SHARED_RINGS. */
+struct md_shared_registration {
+	__u32 size;
+	__u32 version;
+	__aligned_u64 log_address;
+	__u32 log_bytes;
+	__u32 reserved;
+	/* Kernel output: tied to this mm, CPU, and Arena incarnation; not a PID. */
+	__aligned_u64 session;
 };
 
 #endif /* _UAPI_LINUX_MEMORY_DELEGATION_H */

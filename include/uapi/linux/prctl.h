@@ -332,10 +332,17 @@ struct prctl_mm_map {
  * Memory delegation ring registration.
  *
  * arg2: userspace pointer to a struct md_log_ring page shared with the kernel
- * arg3: must be 0
+ * arg3: flags, or 0
  * arg4: target per-CPU arena cpu id
  * arg5: arena data-base virtual address in current->mm
  */
 #define PR_SET_MEMORY_DELEGATION_LOG	74
+#define PR_MEMORY_DELEGATION_F_RESET_ARENA	(1UL << 0)
+#define PR_MEMORY_DELEGATION_F_DRAIN_LOG	(1UL << 1)
+#define PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND	(1UL << 2)
+/* Obsolete ABI; rejected by the shared-rings implementation. */
+#define PR_MEMORY_DELEGATION_F_ASYNC_EXTERNAL	(1UL << 3)
+
+#define PR_MEMORY_DELEGATION_F_SHARED_RINGS	(1UL << 4)
 
 #endif /* _LINUX_PRCTL_H */

@@ -14,8 +14,10 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 				     unsigned int owner_slots);
 void memory_delegation_arena_unregister(unsigned int cpu);
 
+/* F_SHARED_RINGS: ring_addr points to md_shared_registration, not a v1 ring. */
 int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
-				    unsigned long ring_addr);
+				    unsigned long ring_addr,
+				    unsigned long flags);
 
 int memory_delegation_submit_log(unsigned int cpu, unsigned long arena_base,
 				 const struct md_shadow_log *log,
@@ -48,7 +50,8 @@ static inline void memory_delegation_arena_unregister(unsigned int cpu)
 
 static inline int memory_delegation_register_ring(unsigned int cpu,
 						  unsigned long arena_base,
-						  unsigned long ring_addr)
+						  unsigned long ring_addr,
+						  unsigned long flags)
 {
 	return -EOPNOTSUPP;
 }

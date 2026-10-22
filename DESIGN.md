@@ -13,10 +13,10 @@
 我们将原本属于单个进程的 MapAllocatorCache 升级为跨进程共享的更大 MapAllocatorPool。
 - 物理内存池化：为系统的每一个 CPU 核心维护一个全局共享的内存池（Arena）。使用每核心存储（Per-CPU Storage）保存该内存池的 head 指针。在secondary分配大页面时，直接从这个Pool中分配。初始化时，每个进程都通过shared memory接口map好arena；Android 侧 shared memory backing 由常驻系统服务 `memory_delegation_broker` 创建并持有，应用进程只向 broker 获取 fd 并 attach，禁止由任意应用进程创建 memfd、抢 creator lock 或 fork 临时 broker。当系统内存压力达到一个水位线后，分配器开始放弃原本的MapAllocatorCache路径，转为直接在MapAllocatorPool上进行分配，后续物理内存通过实际访问时的page fault获得。
 - 统一虚拟地址预留：为了解决不同进程获取到的内存块在虚拟地址上不连续的问题，在每个进程的虚拟地址空间中，预先划分出一段足够大且固定大小（arena_size 作为全局常量）的连续虚拟地址区间，专门用于映射这些 Arena。实现上，先通过按需分配页面的方式创建shared memory，虚拟地址vma在此时生效，分配时走pagefault方式生成页面。
-- 缓存交接：当进程的 Secondary 分配器释放大块内存时，不再私有化成为 MapAllocatorCache，而是直接加入当前执行核心对应的 Arena 中，供其他进程借用。若 Arena 暂存的数据量超过 arena_size，则直接调用 unmap 交还给内核。
+- 缓存交接：当进程的 Secondary 分配器释放大块内存时，不再私有化成为 MapAllocatorCache，而是直接加入该块虚拟地址归属的 Arena（owner arena）中，供其他进程借用。跨核迁移后释放仍必须回到原 owner arena，不能改投当前执行核心的 Arena。若 Arena 暂存的数据量超过 arena_size，则直接调用 unmap 交还给内核。
 
-2.2 分配机制：无锁化快速投机分配
-- rseq 正确访问：利用 rseq（Restartable Sequences，可重启序列）构建一段不会被调度打断的临界区。进程在此临界区内通过 get_cpu_id 获取当前核心 ID，并直接从全局存储中获取对应 Arena 的地址进行委托分配。防止单核心上因为上下文切换导致的多线程对freelist的并行修改
+2.2 分配机制：当前核心获取与 Mutex 保护的共享状态更新
+- rseq 与用户态互斥：rseq 可用于辅助当前 CPU/Arena 的选择及短序列提交，但不能把包含阻塞 Mutex 的整个分配路径放入 rseq 临界区，也不能把 rseq 理解为禁止抢占。本核正常分配/释放、普通日志发布和本核回收遵守 §2.10 的进程共享 Mutex 协议；跨核 FREE 仅向独立 ring 原子发布请求，不拿 Arena metadata 锁、不修改描述符。迁核后的 Arena 选择须重新校验，释放始终按块的 owner Arena 路由。
 - 极速委托获取：当某线程急需大块内存时，分配器优先从当前核心的 Arena 中摘取内存块分配给它（不再受 MapAllocatorCache 最大条目尺寸限制）。若 Arena 的 freelist 与 bump 均无法满足请求，再回退到原有路径（Cache / mmap）。在 Arena 命中的情况下全程无需内核 mmap 介入，实现真正的应用间资源极速传递。
 - 虚拟内存碎片管理——Bump 指针 + 侵入式空闲链表混合方案：Arena 内部的内存分配采用两阶段设计，兼顾按需 page fault 和高效碎片管理。
   - 阶段一（首次分配——Bump 指针）：Arena 数据区维护一个单调递增的 BumpOffset。首次分配时直接推进 Bump 指针，被分配的页面尚无物理页，通过实际访问时的 page fault 按需提交，全程零系统调用、零元数据写入。
@@ -27,21 +27,22 @@
 2.3 安全与隔离机制 (Security & Isolation) 
 内存委托必须确保空间隔离与原子性。我们在内核调度层引入协同：
 - 内核独占归属表：分配器为每个 Arena 维护一份仅由内核修改的页面归属表 `page_slot[]`，以页为粒度记录当前页面属于哪个 owner slot；`owner_table` 再将 slot 映射到具体进程地址空间（`mm/tgid`）。其中空闲页用保留 slot 值表示。用户态不直接修改这份真值表，只能通过轻量化日志上报“分配/释放”意图。
+- Per-arena 日志有序性：目标协议中，每个 Arena 由所有参与进程共用一个普通 FIFO ring，承载 ALLOC 和本核 FREE；另设一个归属于同一 owner Arena 的跨核 FREE ring。两者均不按进程划分，也不允许混入其他 Arena 的日志。普通 ring 内保持 FIFO；跨 ring 的先后关系通过先提交前置普通日志、再处理跨核 FREE，以及 FREE 成功回执后才允许复用来建立，详见 §2.10。
 - Chunk 代际追踪：Arena 按固定大小分为多个 chunk（建议 64 页，即约 256KB），内核为每个 chunk 维护 `chunk_gen[u64]`。每次处理完一批用户态上报的分配/释放日志后，内核递增全局提交序号，并把受影响 chunk 的 `chunk_gen` 更新为最新代际号，用于标识该 chunk 自上次同步以来发生过映射变化。
-- 上下文切换时的强制解绑：当该核心发生上下文切换（例如从进程 A 切换到进程 B）时，内核拦截调度路径，先处理 `prev` 进程**在本核心上**尚未提交的修改日志并更新arena的 `page_slot[]/chunk_gen[]`（除了本核心arena外，也可能涉及跨核心迁移free的那个arena），再结合 `next` 进程上次已同步的代际号，只检查发生变化的 chunk。内核根据**本arena**中保存的信息修改 `next` 的页表，取消其对“已被其他进程拿走的内存块”的映射权限，从而避免应用越权访问或恶意篡改。
+- 上下文切换时的强制解绑：某个 CPU 发生调度切换时，只消费该 CPU 对应 Arena 的两个共享 ring，覆盖全部参与进程的记录，不局限于 prev_mm，也不遍历其他 Arena。不论 prev/next 是否参与委托，只要本 Arena 已注册且有待处理日志，就应有消费机会；不能沿用仅按 prev_active/next_active 跳过的判断而遗漏其他进程的 pending FREE。消费后更新本 Arena 的 page_slot[]/chunk_gen[]，再按既有安全上下文机制为 next 安排必要的页表同步。日志消费回执不等于所有旧 PTE/TLB 撤权完成，不因消费范围收窄而直接删掉仍有必要的页表同步。
 - PTE Delta Run 快路径：当前实现保留 `chunk_gen[]` 作为正确性兜底，但在日志提交时同步记录 bounded delta run ring。`ALLOC` 成功后记录 `REVOKE_NON_OWNER(start,nr_pages,owner_slot,owner_gen)`，`FREE` 成功后只记录释放块首个 freelist 元数据页的 `PREFAULT_FREE`。`memory_delegation_sync_mm()` 在安全上下文中优先按 delta run 直接执行 unmap/prefault，避免对 dirty chunk 做逐页 snapshot；当 delta ring 被覆盖、ctx 过旧或遇到不完整 delta 时，自动回退到 `chunk_gen[]` 扫描慢路径，保证正确性不依赖 delta ring。
 
 2.4 边界场景处理：跨核与线程迁移
-- 并发访问：由于分配严格绑定在“当前执行核心”的 Arena 上，同一进程的不同线程若运行在不同核心，会分别访问各自核心的 Arena，天然避免了并发访问同一个 Free List 的锁竞争。用户态热路径仅追加本线程或本 Arena 的轻量修改日志，不直接触碰内核真值 `page_slot[]/chunk_gen[]`。
-- 线程跨核迁移：若线程从 Core 1 迁移到 Core 2，无需特殊回滚操作。其在 Core 1 申请的内存在使用完毕释放时，仍会回到 Core1 的 Arena 中。此时对同一个 Arena 的真值更新统一由内核在调度边界原子化消费日志并提交，因为跨核心free导致没有及时提交的log也能容忍，只是有页面被延迟free释放了，避免在用户态分配/释放热路径中引入重型同步。
+- 并发访问：正常获取和描述符 metadata 修改由 owner CPU 上的用户态分配器完成。即使只有本核线程修改，也可能被抢占并由另一线程接续操作，因此本核正常分配/释放与回执回收仍用进程共享 Mutex；竞争时允许阻塞，不编写轮询自旋等待。远端线程只向跨核 FREE ring 原子发布完整请求，不修改 freelist、描述符状态或 generation，不争抢该 Mutex。内核真值 page_slot[]/chunk_gen[] 仍只由内核更新。
+- 线程跨核迁移：线程从 Core 1 迁到 Core 2 后，释放 Core 1 的块时，在完成必要的原分配器释放清理后，只向 Core 1/Arena 的独立跨核 FREE ring 原子投递请求，不写 Core 2 的普通 ring，不修改委托后端描述符。描述符保留原有不可分配状态；待 Core 1 内核消费并反馈成功后，Core 1 上的用户态分配器择机拿本 Arena Mutex，核对记录、generation 与回执，再更新 metadata 并发布为空闲。
 
 2.5 当前拍板的内核实现约束（已确认）
 - owner slot 防复用：接受 generation 防 ABA 方案。slot 不仅是索引，还要带代际校验。
-- switch-out 日志提交：第一版不做异步 worker，保持同步提交，后续再评估复杂度。
+- switch-out 日志提交：不引入异步消费 worker。仅由 owner CPU 的调度路径消费本 Arena 的普通 ring 和跨核 FREE ring；均不是 per-(mm,cpu) ring。先 acquire 确定跨核 FREE ring 中连续完整发布的记录边界，再快照普通 ring 的已发布 tail；先消费普通快照范围，再消费跨核 FREE 快照范围。原子预订游标不是发布边界，遇到未完成槽位必须停止且不等待，详见 §2.10。
 - switch-in 脏区选择：第一版线性扫描 `chunk_gen[]`，不引入额外 dirty 索引结构。
 - 页表失效策略：第一版采用 `unmap`（清 PTE）路径，不采用 `PROT_NONE`。
 - `mm_ctx` 存储位置：只能使用外部 `arena_mm_ctx` 私有表，不改 `mm_struct`/`task_struct` 布局。
-- 跨核 free 延迟：第一版不实现阈值，默认可容忍一个调度周期内的延迟提交。
+- 跨核 free 延迟：允许等待 owner CPU 后续调度消费以及本核用户态分配器后续回收机会，不承诺固定墙钟时间。回执被本核回收前，描述符保持原有不可分配状态；pending 由日志和回执表达，不由远端线程写描述符 Pending。暂不实现通知阈值、IPI 或 worker；没有消费或回收机会时允许暂不复用该块。
 
 2.6 破局方案：定制 `vm_ops->fault` + 尽可能无锁（Lockless）查表（安全红线）
 目标：实现“硬件拦截 + 自动 SIGSEGV”，同时**绝对不修改** Linux 核心的 generic page fault 锁与匿名页缺页路径；把所有权校验与补页决策下沉到专用 VMA 的自定义 fault 慢路径中。
@@ -67,7 +68,7 @@
 2.7 内核侧架构图（第一版，`vm_ops->fault` 路由）
 ```mermaid
 flowchart LR
-    A[User Shadow Log] --> B[switch-out prev: drain log]
+    A[Per-Arena shared normal and remote-FREE rings] --> B[owner CPU switch: drain snapshots]
     B --> C[Kernel Truth: page_slot + owner_table]
     B --> D[chunk_gen + global_commit_seq]
     B --> R[bounded PTE delta run ring]
@@ -111,26 +112,40 @@ flowchart LR
   - 正确性边界：delta ring 只是性能快路径，不是唯一真值。任何内存分配失败、delta 丢失、range 异常或未来出现无法完整生成 delta 的提交路径，都必须回退 `chunk_gen[]` 扫描慢路径。
   - 当前真机结果：在 4 子进程轮流持有 32 MiB arena 块的 revoke/free workload 中，`pte_sync avg` 从约 `8222 -> 402 cycles`（约 95.1% 优化），`dirty_chunks=0`、`snapshot_loop=0`、`delta_fallbacks=0`。
 
----
-三、 子课题二：智能应用感知的内核层资源协同优化
-核心目标：打通推理框架与内核回收链路，解决大模型 KV Cache 治理失准问题，实现语义驱动的精准管控。
 
-3.1 用户态语义标记：MADV_LLM_CACHE 机制
-在 Unified Memory 架构下，LLM 推理时产生的 KV Cache 具有“可舍弃且可重算”的业务特性。
-- 推理框架协同：操作系统向外暴露新的内存建议标志 MADV_LLM_CACHE。
-- 细粒度标记：推理框架在每一层 Transformer 计算完成后，通过 madvise 主动告知内核该层对应的 KV Cache 内存区域状态为“可弹性释放”。直到下一个 Token 生成需要复用该层特征前，这段内存处于“安全回收期”。
+2.10 统一后端异步交接协议修订（2026-10-22，已确认设计，待实现）
 
-3.2 内核态激进回收逻辑
-内核内存管理子系统（MM）在面临极端内存挤兑（如触发 Direct Reclaim）时，改变传统基于 LRU 的盲目回收策略：
-- 特权释放通道：当内核识别到带有 MADV_LLM_CACHE 标记的页时，赋予其最高回收优先级。
-- 穿透 DMA 限制：通常模型运行在 NPU 上时使用 DMA 内存，传统的 madvise 对非匿名页往往无效。内核需在此场景下进行定制，遇到该 Flag 时，无论其是 DMA 映射页还是普通匿名页，一律直接清空并回收物理页，将资源反哺给系统。
+本节及上文关联修订取代 2026-10-21 的 external 异步补充，并按 2026-10-22 后续讨论改为“跨核原子投递、本核加锁回收”。它们规定目标行为，不表示代码已完成或测试已通过。现有远端代码仍有 per-mm ring、每次追加的 ProducerLock、遍历同一 mm 所有 external Arena 的消费路径和 ctx drain_lock；需要按本节调整，不能把现有行为当作目标协议。
 
-3.3 缓存失效感知与按需重算机制
-由于 KV Cache 具有“可舍弃且可重算”的容错特性，当内核激进回收这部分内存后，必须设计一套端到端的闭环机制，以应对 LLM 推理框架在后续 Token 生成中再次访问该内存块的场景。
-- 内核态：定制化缺页异常（Page Fault）路由与零页分配 当 LLM 框架试图再次读取已被内核回收的 KV Cache 虚拟地址时，会触发硬件级的缺页中断（Page Fault）。传统操作系统在处理匿名页缺页时，会尝试从 Swap 分区将数据换入（Swap-in），这会引发严重的磁盘 I/O 阻塞。 在我们的设计中，内核通过 VMA（虚拟内存区域）上的特殊标记（继承自 MADV_LLM_CACHE）识别出这是“已被主动丢弃的可重算页”。此时，内核彻底旁路磁盘 I/O 路径，直接在内存分配器中申请一块全新的、被完全清零的物理页（Zero Page），重新建立页表映射后立即返回用户态。整个陷入与恢复的过程极为轻量。
-- 用户态（LLM 框架）：轻量级状态感知与重算触发 推理框架需要以极低的开销感知到“底层物理页已被替换”，目前设计支持以下两种协同方案：
-  1. 基于 Magic Number 的无锁检测： 为了追求极致的端侧性能，LLM 框架在将 KV Cache 写入内存池时，会在每个 Block 的首部写入一个特定的非零校验码（Magic Number 或 Checksum）。当框架在后续推理中需要读取该 Cache 时，首先校验首部标识。由于内核缺页中断分配的是纯净的“零页”，若框架读取发现标识变成了 0x00000000，即可瞬间断定该段内存已被 OS 征用释放。此时，框架自动挂起当前读取操作，触发底层 NPU/GPU 的**前向重算算子（Recomputation Operator）**来重新生成这部分 KV 状态。
+1. 本核 metadata 仍用 Mutex，跨核 FREE 只原子投递
+   - 每个 Arena 的正常分配、本核释放、描述符/freelist 更新以及成功回执回收，由 owner CPU 上的用户态分配器执行，使用跨参与进程共享、配置为 PTHREAD_PROCESS_SHARED 的 Mutex。它防止同核抢占后另一个线程读到半更新结构，不因“只有本核修改”而删除；竞争时允许阻塞，不编写轮询自旋锁。
+   - 普通路径在同一临界区内校验租约和 generation、准备相关 metadata、写完整普通日志，再 release 更新普通 ring 的 tail，最后完成相应状态发布并解锁。不另叠加只保护 append 的 ProducerLock。内核不拿用户态 Mutex，故内核需要的准备必须在发布之前完成。
+   - 跨核释放者只完成必要的原分配器释放清理，再使用已有租约中的块标识、范围、generation 和进程/会话身份构造 FREE 请求，原子投递到 owner Arena 的跨核 ring。不拿 Arena metadata Mutex，不改描述符状态、generation、freelist、空闲索引或回收游标，也不在发布后继续访问 payload。
+   - 远端请求等待期间，描述符维持原有不可分配状态（如 InUse），不由远端写成 Pending。日志中存在待确认 FREE 并不表示调用者还可使用已释放对象，也不表示该块已经可重新分配；回执回收前禁止获取、split、merge。
 
+2. 每 Arena 两个共享 FIFO 与原子发布
+   - 普通 ring：同一 Arena 的所有参与进程共用，记录 ALLOC 和本核 FREE；追加由本核 Arena Mutex 串行化，按 FIFO 消费。
+   - 跨核 FREE ring：同一 owner Arena 的所有参与进程共用，是多生产者、单内核消费者的原子队列。远端生产者原子预订唯一槽位，填完记录，再 release 发布带环绕序号的每槽位 ready/sequence；具体布局及原子算法待实现时落实。预订计数不表示记录已写完，不能仅 fetch_add 公开 tail 后让内核直接消费。
+   - 内核 acquire 检查槽位，只消费连续完整发布的前缀，不能跳过未完成槽位。遇到生产者被抢占留下的空洞，立即停止本轮该 ring 的消费，不自旋等待；生产者恢复并完成发布后再处理。本方案不承诺某个生产者暂停时后面的记录仍能推进。
+   - 记录必须携带可由内核验证的操作进程/会话身份、块范围和所需 generation，内核据此定位实际 mm。不得使用触发消费的 prev_mm 作为 owner，也不得信任用户态裸 mm 指针或仅凭可复用 PID 认定身份。身份令牌、校验与 mm 生命周期引用的具体 ABI 待实现时落实；注册须协商新能力，不能仅凭旧 ASYNC_EXTERNAL 标志认定兼容。
+   - 一条跨核 FREE 完整发布前，其前置 ALLOC 必须已发布到普通 ring。内核先 acquire 确定跨核 FREE 的连续 ready 前缀边界，再 acquire 快照普通 tail；先消费普通快照，再消费已确定的跨核 FREE 快照。不把快照后才完成发布的 FREE 临时加入本轮，避免其前置 ALLOC 落在普通快照之外。
 
-3.4 架构适配建议 (NPU DMA 内存池化)
-- (补充工程落地考量)：针对普通 DMA 映射难以“只释放其中一段连续物理页”的硬件限制，建议在系统层或 LLM 框架侧实现专属的 DMA 内存池 (DMA Memory Pool)。框架预先申请大块 DMA 内存，并在内部按层级管理 KV Cache。当内核下达回收指令时，框架配合解除局部映射，从而保证软硬件在页面粒度上的回收一致性。
+3. 内核回执后，本核用户态择机完成释放
+   - 内核校验跨核 FREE 的身份、ownership 和 generation，成功更新 ownership 为空闲后，写入可关联到请求 ticket/槽位序号的结果，再 release 发布消费完成边界。内核不直接修改后端描述符。
+   - owner CPU 上的用户态分配器可在后续分配、释放或批量维护时检查回执，无需释放者回来。它在本 Arena Mutex 下 acquire 读取完成边界、确认对应请求成功，校验当前描述符的块范围和 generation，再更新 metadata、推进 generation 并把块插入空闲结构；维护独立的用户态回收进度，避免重复入池。
+   - 内核消费进度与本核用户态回执回收进度不同。共享日志/结果存储必须保留到本核完成回收；仅 kernel head 前进不能允许生产者覆盖尚未被用户态读取的记录或结果。槽位复用须同时满足内核已消费、本核已回收及环绕代际校验，不能只看消费 head。
+   - 完成边界越过 ticket 仅证明已消费，不自动证明成功。被拒绝、重复或过期的 FREE 不得进入空闲索引；保留错误结果并隔离或按内核真值恢复。若采用 sticky last_error，不能清除错误后把此前被拒绝的 FREE 当成功处理。具体错误回执 ABI 待实现时落实。
+   - 普通 ALLOC 不等待回执：现有 fault 与可访问性判断允许 MD_INVALID_SLOT 空闲页被所有参与 mm 访问；从内核已空闲的块，或仍归当前 mm 的块获取时，可以在追加 ALLOC 后直接使用。用户态 Mutex 保证合法获取者互斥，内核拒绝错误仍须反馈处理。
+   - 普通本核 FREE 沿用调度边界保证：其他 mm 获取该块前，owner CPU 必须已消费前面的普通日志；其他 CPU 不能直接获取尚未提交普通 FREE 的候选。正常获取、metadata 修改与回执回收均须满足本核执行约束；阻塞 Mutex 可能导致迁核，必须校验 CPU/Arena 归属并正确重试，不能让旧 CPU 选择绕过此约束。
+   - 回执仅表示 ownership 日志处理结果，不等于所有旧 PTE/TLB 已撤权。既有 PTE/task_work/TLB 同步与数据隔离责任继续保留，不据此宣称已验证所有执行上下文隔离。
+
+4. owner CPU 单消费者、快照与生命周期
+   - 仅 owner CPU 的调度路径消费本 Arena 两个 ring，不按 prev_mm 筛选，不遍历其他 Arena。不要求写入者在 owner CPU 上再次运行；回执后的 metadata 回收由本核用户态完成。
+   - 去掉显式 DRAIN_LOG，包括 overflow 和 close 消费路径；关闭不得在非 owner CPU drain，也不得销毁未消费/未回收请求所需的存储。所有消费入口统一且确认不可重入后删除 ctx drain_lock，不在调度原子上下文换用会睡眠的 Mutex。
+   - 普通 ring 使用 acquire tail 快照；跨核 ring 使用 acquire 确定的连续 ready 前缀快照。两者快照及消费次序遵守第 2 点，遇到未完成槽位不等待。处理后 release 发布内核完成边界；后续本核回收的发布与槽位复用遵守第 3 点。
+   - ring 和回执位于 payload 外的 Arena 共享日志存储，由 Arena/broker 生命周期持有。单个进程退出不销毁它们；Arena 注销须停止新投递、妥善处理未完成预订与回收，并等待在途消费退出后再解除 pin/释放 backing。记录的身份和退出清理同样需要有效期保证。生命周期保护不等于恢复每次 drain 的消费锁。
+
+阶段假设与验证边界：
+- 当前先假设 ring 不会满，容量足够覆盖待消费以及内核已消费但用户态尚未回收的记录；暂不设计 overflow drain、扩容或阻塞等待空间。未完成预订、未消费或未回收的槽位都不得覆盖；槽位序号、容量和回执保留边界须在实现时落实，此假设不代表允许静默丢日志。
+- 允许跨核 FREE 等到 owner CPU 后续调度时消费，再等本核用户态分配器后续回收时才真正发布空闲块；暂不为无调度或无用户态回收机会提供即时推进保证。CPU 热插拔/下线后的消费权转移未在本次约定中解决，后续实现不得让两个 CPU 同时成为消费者。
+- 需要验证：多个远端 CPU 并发投递唯一槽位；生产者预订后被抢占时内核不读取半条记录、不等待；两个快照之间并发发布不反序；原释放进程不回 owner CPU 仍可处理；本核回收前块不可复用；同核抢占下 Mutex 正确；迁核后不误改非本核 metadata；重复/过期/拒绝 FREE 不重复入池；环绕时回执不被提前覆盖；进程退出不销毁共享日志。生产者预订后异常退出造成的空洞恢复、共享 Mutex 持有者异常退出恢复策略尚待落实，不能把异常退出当作普通抢占处理。

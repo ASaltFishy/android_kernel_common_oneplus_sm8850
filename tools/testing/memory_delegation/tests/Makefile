@@ -388,3 +388,9 @@ $(OUT_DIR)/md_alloc_trace_replay: \
 
 clean:
 	@rm -rf "$(OUT_DIR)"
+
+# ABI v2 kernel protocol test, independent of the old Scudo ring producer.
+.PHONY: shared_log_v2_test
+shared_log_v2_test: $(OUT_DIR)/shared_log_v2_test
+$(OUT_DIR)/shared_log_v2_test: shared_log_v2_test.c shared_log_v2.h ../../../../include/uapi/linux/memory_delegation.h | $(OUT_DIR)
+	$(CC) $(CFLAGS_COMMON) -std=gnu11 $< -o $@
