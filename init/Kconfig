@@ -1099,7 +1099,8 @@ config EXT_GROUP_SCHED
 endif #CGROUP_SCHED
 
 config SCHED_MM_CID
-	def_bool y
+	bool "Per-mm concurrency IDs" if EXPERT
+	default y
 	depends on SMP && RSEQ
 
 config UCLAMP_TASK_GROUP

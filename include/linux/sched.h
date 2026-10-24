@@ -1426,16 +1426,7 @@ struct task_struct {
 	unsigned long			numa_pages_migrated;
 #endif /* CONFIG_NUMA_BALANCING */
 
-#ifdef CONFIG_RSEQ
-	struct rseq __user *rseq;
-	u32 rseq_len;
-	u32 rseq_sig;
-	/*
-	 * RmW on rseq_event_mask must be performed atomically
-	 * with respect to preemption.
-	 */
-	unsigned long rseq_event_mask;
-#endif
+
 
 #ifdef CONFIG_SCHED_MM_CID
 	int				mm_cid;		/* Current cid in mm */
@@ -1650,9 +1641,16 @@ struct task_struct {
 	 */
 	struct callback_head		l1d_flush_kill;
 #endif
+#ifdef CONFIG_RSEQ
+	/* Keep the frozen Android task layout when enabling CPU-ID-only rseq. */
+	ANDROID_KABI_USE(1, struct rseq __user *rseq);
+	ANDROID_KABI_USE2(2, u32 rseq_len, u32 rseq_sig);
+	ANDROID_KABI_USE(3, unsigned long rseq_event_mask);
+#else
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
+#endif
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);

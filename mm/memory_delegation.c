@@ -1171,6 +1171,22 @@ out:
 	return ret;
 }
 
+/* Sole owner-CPU consumer. The first fatal normal error survives slot reuse.
+ * STOPPED rejects new publication; successful head never crosses this request.
+ */
+static void md_stop_normal_log(struct md_shared_log *logs, u64 ticket,
+                               const struct md_shared_record *record, int error)
+{
+	if (smp_load_acquire(&logs->state) == MD_SHARED_LOG_STOPPED)
+		return;
+	if (record)
+		logs->normal_error.record = *record;
+	WRITE_ONCE(logs->normal_error.ready, record ? ticket + 1 : 0);
+	WRITE_ONCE(logs->normal_error.result, error);
+	WRITE_ONCE(logs->normal_error.reserved, 0);
+	smp_store_release(&logs->state, MD_SHARED_LOG_STOPPED);
+}
+
 static bool md_drain_shared_arena(unsigned int cpu,
 				 struct md_switch_cycle_stats *stats)
 {
@@ -1189,7 +1205,7 @@ static bool md_drain_shared_arena(unsigned int cpu,
 	if (!arena)
 		goto out;
 	logs = smp_load_acquire(&arena->logs);
-	if (!logs)
+	if (!logs || smp_load_acquire(&logs->state) != MD_SHARED_LOG_RUNNING)
 		goto out;
 	capacity = arena->log_capacity; /* never trust mutable shared layout */
 	normal = logs->slots;
@@ -1220,11 +1236,16 @@ static bool md_drain_shared_arena(unsigned int cpu,
 		struct md_shared_record record;
 		int ret;
 
-		if (smp_load_acquire(&slot->ready) != ticket + 1)
-			break; /* malformed publication: cannot pass preceding ALLOC */
+		if (smp_load_acquire(&slot->ready) != ticket + 1) {
+			md_stop_normal_log(logs, ticket, NULL, -EPROTO);
+			break;
+		}
 		record = slot->record;
 		ret = md_apply_shared_locked(arena, cpu, &record, false, dirty, stats);
-		WRITE_ONCE(slot->result, ret);
+		if (ret) {
+			md_stop_normal_log(logs, ticket, &record, ret);
+			break;
+		}
 		if (record.op == MD_LOG_ALLOC) {
 			MD_STATS_INC(stats, drain_alloc_entries);
 			MD_STATS_ADD(stats, drain_alloc_pages, record.nr_pages);
@@ -1254,12 +1275,15 @@ static bool md_drain_shared_arena(unsigned int cpu,
 	md_commit_dirty_chunks_locked(arena, dirty);
 	write_seqcount_end(&arena->ownership_seq);
 	spin_unlock(&arena->lock);
-	/* Results and committed truth precede completed, not vice versa. */
-	smp_store_release(&logs->normal.completed, arena->normal_head);
+	/* No normal success receipt: committed head directly frees normal slots.
+	 * All prior normal requests succeeded, even if a later one stopped the log.
+	 */
+	smp_store_release(&logs->normal.head, arena->normal_head);
 	smp_store_release(&logs->remote.completed, arena->remote_head);
 	drained = true;
 	goto out;
 corrupt:
+	md_stop_normal_log(logs, arena->normal_head, NULL, -EPROTO);
 	pr_err_ratelimited("memory_delegation: cpu=%u corrupt shared queue; stopped consumption\n", cpu);
 out:
 	rcu_read_unlock();
@@ -1408,7 +1432,6 @@ static bool md_shared_can_unregister(struct md_arena_meta *arena)
 	spin_unlock(&md_mm_ctx_table_lock);
 	if (READ_ONCE(logs->normal.reserved) != arena->normal_head ||
 	    READ_ONCE(logs->remote.reserved) != arena->remote_head ||
-	    smp_load_acquire(&logs->normal.reclaimed) != arena->normal_head ||
 	    smp_load_acquire(&logs->remote.reclaimed) != arena->remote_head)
 		idle = false;
 	for (i = 0; i < arena->nr_pages && idle; i++) {
@@ -1577,7 +1600,7 @@ void memory_delegation_arena_unregister(unsigned int cpu)
 }
 EXPORT_SYMBOL_GPL(memory_delegation_arena_unregister);
 
-/* New registrations negotiate v2 and return an mm-lifetime session token. */
+/* New registrations negotiate v3 and return an mm-lifetime session token. */
 int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 				     unsigned long request_addr,
 				     unsigned long flags)
@@ -1596,6 +1619,9 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 	int ret;
 	bool installed = false;
 
+	if (flags == PR_MEMORY_DELEGATION_F_SHARED_RINGS && !request_addr &&
+	    !cpu && arena_base == MD_SHARED_LOG_QUERY)
+		return MD_SHARED_LOG_VERSION; /* read-only; no Arena/backing created */
 	if (flags != (PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND |
 		      PR_MEMORY_DELEGATION_F_SHARED_RINGS))
 		return -EPROTONOSUPPORT;
@@ -1685,7 +1711,8 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 		}
 	} else {
 		/* Only an empty broker-initialized log can become this Arena's log. */
-		if (logs->normal.reserved || logs->normal.completed || logs->normal.reclaimed ||
+		if (logs->normal.reserved || logs->normal.head || logs->normal_error.ready ||
+		    logs->normal_error.result ||
 		    logs->remote.reserved || logs->remote.completed || logs->remote.reclaimed) {
 			ret = -EBUSY;
 			goto unlock;

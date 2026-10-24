@@ -149,3 +149,75 @@ flowchart LR
 - 当前先假设 ring 不会满，容量足够覆盖待消费以及内核已消费但用户态尚未回收的记录；暂不设计 overflow drain、扩容或阻塞等待空间。未完成预订、未消费或未回收的槽位都不得覆盖；槽位序号、容量和回执保留边界须在实现时落实，此假设不代表允许静默丢日志。
 - 允许跨核 FREE 等到 owner CPU 后续调度时消费，再等本核用户态分配器后续回收时才真正发布空闲块；暂不为无调度或无用户态回收机会提供即时推进保证。CPU 热插拔/下线后的消费权转移未在本次约定中解决，后续实现不得让两个 CPU 同时成为消费者。
 - 需要验证：多个远端 CPU 并发投递唯一槽位；生产者预订后被抢占时内核不读取半条记录、不等待；两个快照之间并发发布不反序；原释放进程不回 owner CPU 仍可处理；本核回收前块不可复用；同核抢占下 Mutex 正确；迁核后不误改非本核 metadata；重复/过期/拒绝 FREE 不重复入池；环绕时回执不被提前覆盖；进程退出不销毁共享日志。生产者预订后异常退出造成的空洞恢复、共享 Mutex 持有者异常退出恢复策略尚待落实，不能把异常退出当作普通抢占处理。
+
+
+2.11 持锁迁核与回执入池修订（2026-10-22，用户确认）
+
+本节取代 §2.2、§2.4、§2.10 中要求整个普通 metadata/日志临界区始终在 owner CPU、迁核后必须退出重试，以及普通 FREE 依赖同核调度即可直接入池的约束。其余双共享 ring、单内核消费者与 PTE 同步规则继续适用。
+
+- 允许 Arena 的进程共享 Mutex 持有者迁核。分配在进入操作时选择当前 CPU 对应的 Arena；持锁之后即使迁核，仍对该 Arena 完成本次 metadata 和普通日志事务。释放始终按原 lease 的 owner Arena 路由。正常操作不要求临时绑定单核。
+- 由于迁核后不能再依赖 owner CPU 已经调度消费普通 FREE，所有启用内核桥接的 FREE 统一等待成功回执后再入池。普通路径在 Mutex 内设置不可分配的 Pending、发布普通 FREE；跨核入口继续只用保存的租约向 remote ring 原子投递，描述符保持 InUse。两条路径均不得在回执前获取、split 或 merge。
+- 用户态回收从 owner CPU 进入，在 Arena Mutex 下 acquire 完成边界，核对逐条成功结果及 block/generation/allocation_id/session/range，再发布空闲；持有 Mutex 后允许迁核。检查 CPU 不构成禁迁核区，因此正确性依靠回执与 Mutex，而不是检查到解锁之间不会迁核。普通 ALLOC 仍按 §2.10 异步提交。
+- 内核消费权不随 Mutex 持有者迁移：仍只有 owner CPU 调度路径按规定快照和次序消费本 Arena 两个 ring。内核不获取用户态 Mutex，不恢复显式 DRAIN。
+- v2 槽位的 reserved 字段为用户态 opaque 数据，内核不解释；本后端用 bit 0 保存远端 FREE 后清零请求。清零必须在成功回执与当前租约核对之后、空闲发布之前执行，过期/被拒绝请求不得预先写 payload。记录自身 reserved 仍必须为 0。
+- 用户已确认异常退出采用保守处理，本次不做自动恢复：生产者预订后退出形成空洞时，不跳过、不覆盖，停止该 ring 后续消费并保留状态；共享 Mutex 持有者死亡不自动修复。恢复须停止所有参与者后重建 Arena，不能把异常退出当普通抢占。
+- 用户已确认恶意参与者伪造发布等安全边界留待后续统一处理。本阶段按参与分配器遵守协议实现；现有 session/ownership/generation 校验保留，但共享日志中的 session 不构成对恶意写入者的认证。回执不代表所有 PTE/TLB 撤权已完成。
+
+
+2.12 同核立即释放与性能实验修订（2026-10-22，用户确认）
+
+本节取代 §2.11 中“所有内核桥接 FREE 统一等回执后入池”的扩大约束，以及本阶段跨参与进程复用时自动清零的要求。
+
+- 普通本核 FREE 在 Arena Mutex 下准备并完整发布普通日志，发布之后确认当前仍在 owner CPU，即可更新共享 metadata、推进 generation 并立即入池，不等待回执。若检查之后迁核，owner CPU 的调度切换可消费检查之前已发布的日志。
+- 若 FREE 持锁期间已迁出 owner CPU，发布日志后保留 Pending，仍等成功回执再入池；跨核入口继续只原子发布 remote FREE，描述符保持 InUse。本节不撤销已经确认的持锁迁核语义。
+- 获取线程在取得 Arena Mutex 后、选择候选前重新核对 CPU；核对后持锁迁核仍允许。所有普通入池均由该 Mutex 串行化。禁止让在外核取得锁的线程直接消费尚未内核提交的本核候选。
+- 普通同核 FREE 的成功回执只回收日志槽位，不再次入池。原描述符可能已 split、merge 或复用，不能要求回执到达时仍保持旧 lease，也不能把成功旧回执应用到新 lease。被拒绝的普通记录继续报告故障并使 Arena fail closed。
+- 本次用户要求先观察性能上限：删除跨进程/跨会话/混合来源的自动整块清零，关闭 EAGER_CLEAR 自动策略。显式 calloc/MD_ZERO 及调用方明确请求的清零保留 API 语义；内核按需提供新页的清零不是本次删除对象。其他 ownership、generation、session 和 PTE 检查保持当前实现。
+- 共享 metadata 和 broker 协议升至版本 7，手机使用新域及新 socket，禁止与版本 6 的活跃参与者混用。内核双 ring ABI 仍为版本 2，无需因此修改或重刷内核。
+
+
+2.13 CPU 查询与用户态热路径优化（2026-10-22）
+
+- CPU 查询优先读取内核维护的 per-thread rseq CPU ID；仅注册时进入内核，稳定路径读取 TLS，不永久缓存核号，不绑定线程 affinity，保留 §2.12 的迁核与 FREE 发布后核号检查。
+- libc 已提供公开 rseq TLS 时借用其注册，不替换、不注销 libc 状态；否则后端为线程注册独立 rseq 区域，并在线程 TLS 释放前注销。fork 继承按内核 rseq ABI 处理。注册不可用或失败时正确回退 sched_getcpu；MD_CPU_QUERY=syscall 可强制回退作同版本对照。
+- rseq 这里只提供 CPU ID 读取，不跨阻塞 Mutex 建立 rseq 临界区，不声称读取核号后禁止迁核。分配选 Arena 和取得 Mutex 后候选检查保留；本核 FREE 发布后的核号检查保留。
+- 去除同一已验证分配入口的重复核号查询；成功 ALLOC 回执只回收日志槽位，成功普通 FREE 回执对已立即发布/复用块不重复更新。Pending/跨核 FREE 与错误结果仍校验租约和回执。描述符大小、共享布局、broker v7 与内核 ring ABI v2 不变。
+- Android 内核启用 CONFIG_RSEQ，关闭 CONFIG_SCHED_MM_CID；后者非 CPU ID 读取必需。rseq task 字段使用 task_struct 原有 KABI 保留空间，避免移动厂商模块使用的既有字段。刷机前须比较 C/受保护 KMI CRC 及 task_struct 布局，并安装同次构建的 system_dlkm 处理内部 Rust 符号版本变化。
+- 验证须覆盖真实迁核、fork、线程退出及 TLS 复用、libc/独立注册/系统调用回退，以及 Backend 双 ring 集成；手机性能以实际 worker 的 rseq_workers/fallback_cpu_workers 标记确认路径，不把 QEMU 时延当作真机性能。
+- 后端操作局部视图仅携带 Arena 所需字段，不复制进程私有初始化 Mutex、FD 和生命周期管理状态。已由公共分配入口校验的参数不在持锁内部重复校验；页大小验证为 2 的幂后，热路径页数取整采用预计算 shift。
+- RunDescriptor 的访问均由 ArenaMutex 串行化，状态/释放 ticket 的锁内读写可使用 relaxed 原子；对其他分配器的 metadata 发布由 Mutex unlock 完成。该精简不适用于共享 ring 的 tail、ready、completed、reclaimed 或进程初始化发布，后者仍保持原有 acquire/release 约束。
+- Android 构建对普通 Scudo 与统一后端统一启用 ThinLTO，保留实际路线计数和 fallback，不以更换分配路线制造提速。Scudo 启用状态以一次 acquire 快照读取；已完成启用判断的调用链不重复判断。
+
+2.14 用户态分配热路径精简（2026-10-22，源码已修改，待用户构建验证）
+
+- 分配保持既有 bin/候选遍历顺序。候选仍须为 Free；仅当页数完全一致且起始页满足所需对齐时，直接从共享 bin 和地址链表摘除整块，跳过通用 prefix/suffix split 路径与不变范围的重复写入。generation、Claiming/InUse 转换、lease、ALLOC 提交和错误回滚继续执行；不新增进程私有缓存。
+- 新增内部桥接入口 md_kernel_bridge_alloc：在与普通发布相同的 session/CPU、运行状态、序号和容量校验通过后，直接在未发布的可复用槽位填写完整 ALLOC 记录，明确写零 flags/record.reserved/slot.reserved。ready 的 relaxed 写入及 normal.reserved 的 release 发布保持既有顺序。共享 metadata、broker v7 和内核 ring ABI v2 不变；普通 FREE 和远端 FREE 语义不变。
+- 回执回收仍先读取 acquire completed（无内核模式的 remote 仍检查连续 ready 前缀）并校验完成边界。仅当 completed == reclaimed 时跳过该队列后续处理及无变化的游标写回；有完成记录时仍逐条检查、处理错误、回收和 release 发布，不能以此延迟必要的确认。
+- 保留分段探针及默认关闭设置。本次按用户要求不编译、不运行正确性或性能测试；源码变化不代表已有二进制更新或性能收益已验证。多进程长尾的具体成因未在本次解决。
+
+2.15 分配路径代码布局优化（2026-10-22，已编译，待用户测试）
+
+- 用户对 §2.14 的完整矩阵测试未显示明确的 cache 差距收敛，本节不宣称上一轮优化已带来可测收益。
+- 将 fork 重注册拆成内联的稳定 PID/acquire 发布状态检查，以及 noinline/cold 的实际重注册函数。进程身份、锁内二次检查和 bridge 重新建立行为保留；未缓存永久核号。
+- 共享池获取、通用 split、bump 各自分离代码边界，失败回滚独立为 noinline/cold 函数，成功提交保持内联。该调整只影响机器码布局和调用关系；bin 遍历顺序、共享锁覆盖范围、候选校验、租约与 generation、日志发布及 MD_ZERO 均保留。
+- 分段探针 stage 5 在 bump 路径仍于候选构造结束、分配提交之前停止；正式性能比较使用关闭探针的构建。
+- Android 机器码中 md_acquire_flags 从 3408 字节缩至 644 字节，acquireLocal 独立为 1284 字节。函数拆分会增加调用，入口栈帧缩小不代表整条调用链栈用量同比缩小；代码尺寸改善不等于时延收益。按用户测试偏好，本轮只编译并检查反汇编，未运行测试。使用新旧二进制的同条件对照判断是否保留此优化。
+
+2.16 Secondary 数字统计编译开关（2026-10-24，用户要求）
+
+- 将可观测数字计数与存活块链表分开：InUseBlocks 仍用于 iterateOverBlocks/malloc_iterate，链表插入、删除及其 Mutex 保留；AllocatedBytes/FreedBytes/FragmentedBytes/LargestSize、NumberOfAllocs/NumberOfFrees 和 Secondary LocalStats 更新可以通过 SCUDO_SECONDARY_STATS=0 编译移除。
+- Scudo 源码默认 SCUDO_SECONDARY_STATS=1，保留正常统计 API。Android latency benchmark 构建脚本默认 0，统一作用于 cache、mmap、delegated 及旧 SharedArena 路径。可用 SCUDO_SECONDARY_STATS=1 显式恢复。正式比较必须记录该设置，不能把关闭统计后的 benchmark 宣称为统计 API 完整的生产配置。
+- 关闭后不将 Secondary LocalStats 链入全局统计，Secondary getStats 明确输出 accounting disabled；全局内存统计因此不含 Secondary，此配置不能用于依赖完整 malloc/mallinfo 记账的业务验证。cache 命中/实际路线诊断计数、Backend 协议状态及日志保留。
+- 构建 ID 与 manifest 纳入统计开关；benchmark build-info/lifecycle 输出 scudo_secondary_stats。已完成开、关两种 Android 编译，按用户此前测试偏好未运行测试，未声称有性能收益。共享 metadata、Header、Descriptor 布局及内核 ABI 不变。
+
+2.17 普通日志由内核直接回收（2026-10-24，用户确认）
+
+本节覆盖此前对所有普通成功日志也保留用户态回收游标的要求；其余 ownership、共享 Mutex、迁核与 PTE 同步规则保留。
+
+- 普通 ring 改为 tail（normal.reserved）与内核 head（normal.head）。head 是已经成功消费并提交真值的连续前缀，release 发布后槽位立即可复用；不再有普通 completed/reclaimed，不再逐条扫描普通成功 ALLOC/已本核立即入池 FREE 的回执，也无需对记录字节清零。
+- 普通请求失败时，内核把首错请求、ticket 和错误保存在槽位之外的 normal_error，release 发布 STOPPED，停止后续消费；head 不跨越失败请求。用户态检查停止状态并 fail closed，不能把拒绝当成功或覆盖错误。远端队列错误仍逐条保留结果，不自动扩大成正常请求成功。
+- 普通 FREE 发布后若仍在 owner CPU，立即入共享池。若已迁核，描述符保持 Pending，保存 ticket+1，并加入共享 Mutex 保护的 PendingHead 链表。owner 用户态持锁按成功 head 确认后才入池；Pending 期间块的 lease/state/range 不得被 split/merge/reuse。普通槽位即便已环绕复用，也不影响这一确认，不再读取已释放的普通记录。
+- 远端 FREE 继续使用 reserved/completed/reclaimed 和逐槽结果，用户态核对成功与租约后更新 metadata 并回收远端槽位。内核仍只由 owner CPU 调度路径消费，先快照 remote ready 前缀，再快照 normal tail，先普通后远端。持锁迁核意味着普通生产者与 owner 内核也可能并发，发布内存序不变。
+- ABI 升至共享 ring v3，metadata/broker 升至 v8；使用只读版本查询及注册版本双重拒绝旧内核。新域 allocator_delegation_v8、新目录 md_backend_v8 只用于新内核启动后的新 backing；不能在当前 v2 内核启动上换 backing 混用。
+- 与 §2.16 的数字统计开关一同提交：时延构建对 cache/mmap/delegated 一致关闭 Secondary 数字统计，保留 InUseBlocks、枚举接口所需锁和路线计数。源码生产默认保留统计，日志和构建清单记录配置。
+- 本次只编译并更新测试源码，未运行测试、未刷机。正常 head 不表示 PTE/TLB 撤权已完成。旧版 pinned 刷机脚本仍锁定旧产物，不能直接用来部署新协议内核。
