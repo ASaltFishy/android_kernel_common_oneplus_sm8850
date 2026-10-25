@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Standalone shared-ring v3 final-state PTE regression.
+ * Standalone shared-ring v3 final-state PTE and VMA-fault regression.
  * Run in a fresh QEMU guest, with debugfs switch statistics enabled and no
  * existing delegation broker/arena. An arena cannot change its pinned backing
  * during one boot. Argument 1 asserts PTE retention; 0 tests the old baseline.
- * Build: aarch64-linux-gnu-gcc -O2 -static final_state_sync_test.c -o final-state-test
+ * Build: aarch64-linux-gnu-gcc -O2 -static -pthread final_state_sync_test.c -o final-state-test
  */
 #define _GNU_SOURCE
 #include "shared_log_v2.h"
 #include <sched.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -122,6 +124,17 @@ static unsigned char readp(unsigned p)
 static void writep(unsigned p, unsigned char v)
 {
 	*(volatile unsigned char *)(base + p * pg) = v;
+}
+static atomic_int stop_readers;
+static void *read_worker(void *arg)
+{
+	cpu_set_t cpus;
+	CPU_ZERO(&cpus);
+	CPU_SET((uintptr_t)arg, &cpus);
+	CHECK(!sched_setaffinity(0, sizeof(cpus), &cpus));
+	while (!atomic_load_explicit(&stop_readers, memory_order_relaxed))
+		CHECK(readp(65) == 0x44);
+	return NULL;
 }
 static void denied(unsigned p)
 {
@@ -257,6 +270,28 @@ int main(int argc, char **argv)
 	logs->log_bytes = log_bytes;
 	ctl = mmap(NULL, pg, 3, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	CHECK(ctl != MAP_FAILED);
+	if (argc > 2 && atoi(argv[2])) {
+		/* Build a real large cached folio through an unwrapped alias, then
+		 * exercise page-granular read mapping from a NOHUGEPAGE arena.
+		 */
+		unsigned char *alias = mmap((void *)0x5000000000UL, 2UL << 20,
+			3, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+		CHECK(alias == (void *)0x5000000000UL);
+		CHECK(!madvise(alias, 2UL << 20, MADV_HUGEPAGE));
+		*(volatile unsigned char *)alias = 0;
+		FILE *f = fopen("/proc/meminfo", "r");
+		char line[256];
+		unsigned long huge_kb = 0;
+		CHECK(f);
+		while (fgets(line, sizeof(line), f))
+			if (sscanf(line, "ShmemHugePages: %lu kB", &huge_kb) == 1)
+				break;
+		fclose(f);
+		CHECK(huge_kb >= 2048);
+		CHECK(!munmap(alias, 2UL << 20));
+		CHECK(!madvise(base, PAGES * pg, MADV_NOHUGEPAGE));
+		printf("LARGE_CACHED_FOLIO verified_shmem_huge_kb=%lu\n", huge_kb);
+	}
 	reg();
 	int a[2], b[2];
 	CHECK(!pipe(a) && !pipe(b));
@@ -291,6 +326,35 @@ int main(int argc, char **argv)
 	CHECK(readp(65) == 0x44);
 	CHECK(minflt() == before);
 	puts("PASS(final): mixed chunk revokes only foreign ranges, hole PTE retained");
+	/* Force a read fault beside two resident pages belonging to the child.
+	 * A generic filemap fault-around must never populate either neighbour.
+	 * mprotect splits the wrapped VMA and exercises its shared lifetime.
+	 */
+	CHECK(!mprotect(base + 64 * pg, 3 * pg, PROT_READ));
+	CHECK(!madvise(base + 63 * pg, 5 * pg, MADV_DONTNEED));
+	CHECK(readp(63) == 0);
+	CHECK(readp(65) == 0x44);
+	denied(64);
+	denied(66);
+	CHECK(!mprotect(base + 64 * pg, 3 * pg, PROT_READ | PROT_WRITE));
+	writep(65, 0x44);
+	puts("PASS(final): read fault neighbours denied after VMA split and PTE discard");
+	pthread_t readers[2];
+	for (uintptr_t i = 0; i < 2; i++)
+		CHECK(!pthread_create(&readers[i], NULL, read_worker, (void *)(i + 1)));
+	for (unsigned i = 0; i < 100; i++) {
+		CHECK(!mprotect(base + 64 * pg, 3 * pg, PROT_READ));
+		CHECK(!madvise(base + 65 * pg, pg, MADV_DONTNEED));
+		command(a[1], b[0], 3, 0);
+		command(a[1], b[0], 2, 0);
+		CHECK(!mprotect(base + 64 * pg, 3 * pg, PROT_READ | PROT_WRITE));
+	}
+	atomic_store_explicit(&stop_readers, 1, memory_order_relaxed);
+	for (unsigned i = 0; i < 2; i++)
+		CHECK(!pthread_join(readers[i], NULL));
+	denied(64);
+	denied(66);
+	puts("PASS(final): concurrent read faults, VMA split and adjacent ownership handoffs");
 	command(a[1], b[0], 3, 0);
 	CHECK(readp(64) == 0x51 && readp(66) == 0x52);
 	uint64_t mine = alloc(512, 512);

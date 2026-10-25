@@ -11,6 +11,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/pagemap.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
@@ -171,6 +172,8 @@ struct md_vma_wrap {
 
 static vm_fault_t md_arena_vma_fault(struct vm_fault *vmf);
 static vm_fault_t md_arena_vma_page_mkwrite(struct vm_fault *vmf);
+static vm_fault_t md_arena_vma_map_pages(struct vm_fault *vmf,
+				       pgoff_t start, pgoff_t end);
 static void md_arena_vma_open(struct vm_area_struct *vma);
 static void md_arena_vma_close(struct vm_area_struct *vma);
 
@@ -179,6 +182,19 @@ static const struct vm_operations_struct md_arena_vm_ops = {
 	.close = md_arena_vma_close,
 	.fault = md_arena_vma_fault,
 	.page_mkwrite = md_arena_vma_page_mkwrite,
+};
+
+/*
+ * Only the original shmem callbacks are audited for per-VMA locking.  Keep
+ * arbitrary wrapped vm_ops on the mmap-lock fallback above.  The real read
+ * map_pages callback below never maps an unchecked neighbouring page.
+ */
+static const struct vm_operations_struct md_arena_shmem_vm_ops = {
+	.open = md_arena_vma_open,
+	.close = md_arena_vma_close,
+	.fault = md_arena_vma_fault,
+	.page_mkwrite = md_arena_vma_page_mkwrite,
+	.map_pages = md_arena_vma_map_pages,
 };
 
 static int md_memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
@@ -513,7 +529,8 @@ static struct md_arena_meta *md_get_arena_rcu(unsigned int cpu)
 /* 功能：判断 VMA 是否已被 memory delegation 的 vm_ops 包装；调用时机：安装 vm_ops 或 fault 快速分流时调用。 */
 static inline bool md_vma_is_wrapped(const struct vm_area_struct *vma)
 {
-	return vma && vma->vm_ops == &md_arena_vm_ops;
+	return vma && (vma->vm_ops == &md_arena_vm_ops ||
+		       vma->vm_ops == &md_arena_shmem_vm_ops);
 }
 
 /* 功能：从已包装 VMA 中取出 delegation 私有包装信息；调用时机：VMA open/close/fault 和 page_mkwrite 回调中调用。 */
@@ -521,7 +538,7 @@ static struct md_vma_wrap *md_vma_wrap_get(const struct vm_area_struct *vma)
 {
 	if (!vma)
 		return NULL;
-	if (vma->vm_ops != &md_arena_vm_ops)
+	if (!md_vma_is_wrapped(vma))
 		return NULL;
 	return (struct md_vma_wrap *)vma->vm_private_data;
 }
@@ -709,6 +726,67 @@ static vm_fault_t md_arena_vma_fault(struct vm_fault *vmf)
 	return wrap->orig_ops->fault(vmf);
 }
 
+/*
+ * Read faults can map only the checked page, including when it is a subpage
+ * of a large cached folio.  Do not forward filemap_map_pages(): its PMD path
+ * can map unchecked neighbours, even after an earlier PTE-table check races
+ * with page-table retraction.  No allocation, I/O or sleeping folio lock is
+ * allowed in this RCU callback.  Missing pages/tables use checked ->fault.
+ * VMA locking pins the immutable wrapper, file and address geometry; arena
+ * truth retains its RCU + ownership_seq protection.
+ */
+static vm_fault_t md_arena_vma_map_pages(struct vm_fault *vmf,
+				       pgoff_t start, pgoff_t end)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct address_space *mapping = vma->vm_file->f_mapping;
+	struct folio *folio;
+	struct page *page;
+	pte_t *saved_pte = vmf->pte;
+	vm_fault_t ret = 0;
+
+	if (vmf->pgoff < start || vmf->pgoff > end)
+		return 0;
+	if (!md_fault_addr_allowed(vma, vmf->address))
+		return VM_FAULT_SIGSEGV;
+	if (pmd_none(*vmf->pmd) || pmd_trans_huge(*vmf->pmd) ||
+	    pmd_devmap(*vmf->pmd))
+		return 0;
+
+	folio = filemap_get_folio(mapping, vmf->pgoff);
+	if (IS_ERR(folio))
+		return 0;
+	if (!folio_trylock(folio))
+		goto put;
+	if (folio->mapping != mapping || !folio_test_uptodate(folio) ||
+	    folio_test_readahead(folio) ||
+	    vmf->pgoff >= DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE))
+		goto unlock;
+	page = folio_file_page(folio, vmf->pgoff);
+	if (PageHWPoison(page))
+		goto unlock;
+
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+				       vmf->address, &vmf->ptl);
+	if (!vmf->pte)
+		goto restore;
+	/* Leave markers and concurrent mappings to the normal fault path. */
+	if (pte_none(ptep_get(vmf->pte))) {
+		set_pte_range(vmf, folio, page, 1, vmf->address);
+		folio_ref_inc(folio);
+		add_mm_counter(vma->vm_mm, mm_counter_file(folio), 1);
+		ret = VM_FAULT_NOPAGE;
+	}
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+restore:
+	vmf->pte = saved_pte;
+unlock:
+	folio_unlock(folio);
+put:
+	folio_put(folio);
+	return ret;
+}
+
 /* 功能：对 arena 写保护 fault 执行 ownership 检查后转发原始 page_mkwrite；调用时机：用户写入只读或 CoW arena 页面时调用。 */
 static vm_fault_t md_arena_vma_page_mkwrite(struct vm_fault *vmf)
 {
@@ -774,8 +852,15 @@ static int md_install_vma_ops(struct mm_struct *mm, unsigned int cpu,
 	wrap->owner_vma = vma;
 	refcount_set(&wrap->refs, 1);
 
+	/* Exclude per-VMA faults before publishing immutable wrapper state. */
+	vma_start_write(vma);
 	vma->vm_private_data = wrap;
-	vma->vm_ops = &md_arena_vm_ops;
+	if (vma_is_shmem(vma) && wrap->orig_ops &&
+	    wrap->orig_ops->map_pages == filemap_map_pages &&
+	    !wrap->orig_ops->page_mkwrite)
+		vma->vm_ops = &md_arena_shmem_vm_ops;
+	else
+		vma->vm_ops = &md_arena_vm_ops;
 
 	/* Ensure open() is run for consistency with other vm_ops users. */
 	md_arena_vma_open(vma);
@@ -802,6 +887,8 @@ static int md_unmap_range_locked(struct mm_struct *mm, unsigned long start,
 			break;
 
 		unmap_end = min(end, vma->vm_end);
+		/* mmap_write_lock alone does not exclude per-VMA read faults. */
+		vma_start_write(vma);
 		zap_page_range_single(vma, cursor, unmap_end - cursor, NULL);
 		cursor = unmap_end;
 	}

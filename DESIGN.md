@@ -250,3 +250,14 @@ flowchart LR
 - 本实现不减少 ownership 逐条消费成本，也未更改跨进程清零策略。性能结论须区分 PTE 同步、日志消费和真实触页端到端开销。
 
 - 真机使用同一 Scudo 二进制，CPU0 固定 1.44 GHz，完成基线→候选→恢复基线对照，每个配置三轮。PTE 同步及重复复用后的逐页触碰成本明显下降；纯交接时间未显示一致的大幅收益，仍受逐条 ownership 消费及调度影响。四进程真实移交隔离、单进程与多线程回归通过，结束后已按 GNU Build ID 确认恢复原内核及 broker。计时口径为 CNTVCT tick，不是 PMU CPU cycles。
+
+
+2.21 Arena shmem 缺页保留 per-VMA 锁路径（2026-10-25）
+
+- 仅对 vma_is_shmem() 确认的原生 shmem VMA，且原 map_pages 为 filemap_map_pages、无原 page_mkwrite 时，安装经过审查的专用 vm_ops。其他映射保留 mmap-lock 回退。通用 page fault 锁与匿名页路径不修改。
+- 包装对象随 VMA 引用计数存活，安装包装及 PTE 撤销前调用 vma_start_write()；mmap_write_lock 单独不能排除 per-VMA fault，必须等待已有 VMA 读者退出后再撤权。所有权读取仍使用 RCU 与 ownership_seq，不在 fault 增加 arena spinlock/mutex。
+- read map_pages 回调只查找已驻留 folio、trylock 并验证 mapping/uptodate/文件边界/HWPoison，再持 PTE 锁用 set_pte_range 安装当前一页，正常增加 PTE 引用及 RSS/rmap 记账。不分配、不做 I/O、不转发 filemap_map_pages，避免并发 PTE table 撤回后意外走 huge PMD 映射。缺失 folio/PTE table、锁竞争、markers 或 huge/devmap PMD 均回退原 checked fault。
+- 保留原始 shmem fault 的缺页分配、folio/dirty 记账与重试语义，以及 page_mkwrite 的归属复查。不进行 ALLOC 预触碰或批量写映射。
+- QEMU 回归覆盖读缺页相邻外来页拒绝、VMA 拆分、跨 CPU 并发读缺页和相邻块反复交接，以及实际大 folio backing 下的单 PTE 映射，及既有最终状态/代际/丢失 delta 回归；共享 ring v3 与 KABI 检查通过。真机完成旧→候选→旧的同二进制、CPU0 固定 1.44 GHz 对照，共 1350 个无逐 fault 探针的纯 touch 样本。四进程全量补页窗口 CPU 中位数：32 MiB 为 11.856/10.550/11.877 ms（约降低 11%），256 MiB 为 101.229/84.496/98.151 ms（约降低 14%–17%）。这些是完整 touch 窗口的 CPU 时间，包含期间 task_work，不能当成单个函数的独占耗时。
+- 独立逐 fault 探针确认：每个 256 MiB 全量补页窗口的 minor faults 仍为 65536；handle_mm_fault 为旧 131072 / 候选 65536 / 恢复旧 131072，RETRY 为 65536 / 0 / 65536；trace 无丢失或 kretprobe miss。重探针时间不用于性能比较。
+- 整体长尾未稳定改善，128 KiB 四进程出现更多触页缺页与较慢样本，不能宣称全矩阵普遍提速。真机真实四进程撤权回归三轮、单进程、多线程通过；手机已按 GNU Build ID 恢复至测试前 d81a63de 内核，临时探针已清理。用户随后要求提交并永久部署本阶段优化；上述小请求和长尾局限仍保留，批量写建图尚未实现。
