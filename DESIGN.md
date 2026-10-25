@@ -221,3 +221,19 @@ flowchart LR
 - ABI 升至共享 ring v3，metadata/broker 升至 v8；使用只读版本查询及注册版本双重拒绝旧内核。新域 allocator_delegation_v8、新目录 md_backend_v8 只用于新内核启动后的新 backing；不能在当前 v2 内核启动上换 backing 混用。
 - 与 §2.16 的数字统计开关一同提交：时延构建对 cache/mmap/delegated 一致关闭 Secondary 数字统计，保留 InUseBlocks、枚举接口所需锁和路线计数。源码生产默认保留统计，日志和构建清单记录配置。
 - 本次只编译并更新测试源码，未运行测试、未刷机。正常 head 不表示 PTE/TLB 撤权已完成。旧版 pinned 刷机脚本仍锁定旧产物，不能直接用来部署新协议内核。
+
+2.18 外部 Backend 大块并存容量（2026-10-24）
+
+- 真机确认旧默认 512 MiB Arena 下，Scudo 的 256 MiB 请求在加 Header/对齐后为 268435600 字节，两个同时存活即无法容纳；128 MiB 请求加开销后四个也无法容纳，md_acquire 返回 ENOMEM 并触发 secondary fallback。
+- 外部 Backend 默认 payload 容量及内核注册上限统一调整为每 CPU Arena 2 GiB，支持四个 256 MiB 请求及其元数据/对齐开销。原分配器内部共享 Arena 的 VA 布局不改，ring ABI v3 与 metadata/broker v8 不变。容量与 stride 由 broker 和各客户端一致校验；切换容量必须在重启后使用新 backing，禁止同启动混用。
+- payload 仍按需缺页分配；内核页级所有权数组随容量增加，不能把扩容理解为零内存开销。
+- dirty chunk bitmap 随 Arena 注册预分配，消费和 mm 退出共同在 arena->lock 内清零/使用；分配失败、注册竞争和注销路径均释放 bitmap。调度消费路径不新增动态分配，也不把扩大后的 bitmap 放到内核栈上。
+- 新增 Scudo 四块同时持有回归测试，旧容量下记录 ENOMEM，修复容量下要求全部委托。tests/run_phone_v3_tests.sh 默认禁止 fallback，generic runner 保留 ALLOW_FALLBACK 显式配置以兼容测试 primary 路径的旧矩阵。
+
+2.19 慢样本定位与 PTE delta replay 合并（2026-10-25）
+
+- 真机逐次 CLOCK_MONOTONIC 分配时间与独立 tracefs instance 的 sched/IRQ/kprobe 轨迹对齐，确认毫秒级样本包含调度切出，以及恢复用户态前的 md_sync_task_work。诊断记录预分配，测量结束后才输出，不在 alloc 区间加入打印或额外系统调用。
+- 页表同步中存在同一范围反复 zap 的开销：一次同步可为 4 个不同范围执行约 420 次 zap。delta record 保留原语义与所有权校验，只把符合条件的连续 revoke 的重叠/相邻范围取连续并集；遇到不相接的范围先 flush，绝不跨空洞扩大范围；PREFAULT_FREE 之前必须 flush，保持其与 revoke 的顺序。结束与错误返回前也 flush 待处理的 revoke。
+- delta serial 的 seq 随提交非递减，因此两次快照查找改为从保留历史尾部向前扫描，到 seq<=last_seen 即停止。复制时倒序填充临时数组，仍按原始时间顺序 replay；保留 delta_loss_seq、范围和容量检查，并在两次快照计数不一致时退回 chunk 扫描。
+- 新增 retained-delta 与环绕丢失后的集成回归：子进程反复借用两侧页面，父进程的旧 PTE 必须被撤销；中间仍归父进程持有的页面必须保留原 PTE，不能靠事后缺页恢复来掩盖过宽撤销。环绕测试分批 checkpoint，避免填满普通发布 ring。
+- benchmark 增加 max 输出。逐次时间记录为 MD_SLOW_TRACE=1 的可选构建，正式时延构建默认关闭，并在 manifest 标识。墙钟时延继续包含调度与中断时间，不筛除慢样本，也不改用实时调度来隐藏多进程切换。
