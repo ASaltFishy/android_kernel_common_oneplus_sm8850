@@ -237,3 +237,16 @@ flowchart LR
 - delta serial 的 seq 随提交非递减，因此两次快照查找改为从保留历史尾部向前扫描，到 seq<=last_seen 即停止。复制时倒序填充临时数组，仍按原始时间顺序 replay；保留 delta_loss_seq、范围和容量检查，并在两次快照计数不一致时退回 chunk 扫描。
 - 新增 retained-delta 与环绕丢失后的集成回归：子进程反复借用两侧页面，父进程的旧 PTE 必须被撤销；中间仍归父进程持有的页面必须保留原 PTE，不能靠事后缺页恢复来掩盖过宽撤销。环绕测试分批 checkpoint，避免填满普通发布 ring。
 - benchmark 增加 max 输出。逐次时间记录为 MD_SLOW_TRACE=1 的可选构建，正式时延构建默认关闭，并在 manifest 标识。墙钟时延继续包含调度与中断时间，不筛除慢样本，也不改用实时调度来隐藏多进程切换。
+
+
+2.20 PTE 按最终权限同步（2026-10-25，已实现并通过 QEMU 与真机回归）
+
+- 普通和 remote FREE 日志仍按既有协议逐条消费与校验。delta 只作为 (last_seen, target_seq] 的地址索引，先线性折叠时间相邻的重叠范围，再按需排序并合并重复、重叠、相邻范围，不跨地址空洞扩张。
+- 本轮目标版本固定。复制完整 delta 后在 arena->lock 下按当前 page_slot、owner_table、owner generation 选择需要撤销的区间；当前 mm 合法持有或空闲页保留已有 PTE。底层 backing 与 arena 绑定不变，不提前建立新 PTE，保留按 fault 建图。
+- 新增内核私有 chunk_owner 保守摘要，只记录 uniform slot/generation。完整 chunk 的所有权赋值直接更新摘要；局部改动不能证明一致时仅标 mixed，绝不猜测其余页归属。mm_release 隔离页面同步使摘要失效。页级真值不变；摘要只在 arena 锁内读写，不进入 fault 热路径。
+- uniform chunk 按范围判断；mixed chunk 只检查本轮交集页。最多输出 256 个撤销区间、检查 4096 个 mixed 页；超过预算、delta 丢失、异常或内存分配失败回退原 chunk 真值扫描。
+- 新快路径仅撤销映射，并在选择前和操作后复核 global_commit_seq。并发提交使快路径返回 EAGAIN，转入现有最终状态 chunk 兜底；只有本轮同步成功才推进 last_seen。已经执行的 PTE 操作标记不因快路径回退而清除。版本之后的新变化仍保留为下一轮待处理内容。
+- PREFAULT_FREE 等旧侵入式 metadata 需求走原有按当前状态的 chunk 兜底，不再逐条重放 prefault。新快路径不改变 fault 准入、VMA、所有权发布／交接完成边界，也不以日志 head 代替撤权完成。
+- 本实现不减少 ownership 逐条消费成本，也未更改跨进程清零策略。性能结论须区分 PTE 同步、日志消费和真实触页端到端开销。
+
+- 真机使用同一 Scudo 二进制，CPU0 固定 1.44 GHz，完成基线→候选→恢复基线对照，每个配置三轮。PTE 同步及重复复用后的逐页触碰成本明显下降；纯交接时间未显示一致的大幅收益，仍受逐条 ownership 消费及调度影响。四进程真实移交隔离、单进程与多线程回归通过，结束后已按 GNU Build ID 确认恢复原内核及 broker。计时口径为 CNTVCT tick，不是 PMU CPU cycles。

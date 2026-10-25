@@ -17,6 +17,7 @@
 #include <linux/seqlock.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/sort.h>
 #include <linux/string.h>
 #include <linux/task_work.h>
 #include <linux/vmalloc.h>
@@ -35,6 +36,8 @@
 	(MD_EXTERNAL_ARENA_CAPACITY / PAGE_SIZE)
 #define MD_DEFAULT_OWNER_SLOTS		254
 #define MD_PTE_DELTA_RUN_CAPACITY	4096U
+#define MD_FINAL_RANGE_CAPACITY		256U
+#define MD_FINAL_MIXED_PAGES_MAX	4096U
 #define MD_ARENA_MODE_EXTERNAL		2UL
 
 enum md_sync_state {
@@ -67,6 +70,17 @@ struct md_pte_delta_run {
 	u32 nr_pages;
 };
 
+/* A conservative hint: U16_MAX means mixed/unknown, never an owner slot. */
+struct md_chunk_owner {
+	u32 gen;
+	u16 slot;
+};
+
+struct md_page_range {
+	u32 start;
+	u32 end;
+};
+
 struct md_arena_meta {
 	spinlock_t lock;
 	seqcount_t ownership_seq;
@@ -81,6 +95,7 @@ struct md_arena_meta {
 	u8 *page_prefault;
 	u32 *page_owner_gen;
 	u64 *chunk_gen;
+	struct md_chunk_owner *chunk_owner;
 	/* Registration-time scratch; reset/use only while holding arena->lock. */
 	unsigned long *dirty_chunks;
 	u64 *page_allocation;
@@ -929,6 +944,29 @@ static bool md_u32_range_all_equal(const u32 *array, u32 start, u32 end,
 	return true;
 }
 
+/* Called with arena->lock after a uniform ownership assignment. Partial
+ * writes only invalidate the hint; they never guess that the rest agrees.
+ */
+static void md_assign_chunk_owner_locked(struct md_arena_meta *arena,
+					u32 start, u32 end, u16 slot, u32 gen)
+{
+	u32 pages = md_current_chunk_pages();
+	u32 chunk;
+
+	for (chunk = start / pages; chunk <= (end - 1) / pages; chunk++) {
+		struct md_chunk_owner *hint = &arena->chunk_owner[chunk];
+		u32 first = chunk * pages;
+		u32 last = min(first + pages, arena->nr_pages);
+
+		if (start <= first && end >= last) {
+			hint->slot = slot;
+			hint->gen = gen;
+		} else if (hint->slot != slot || hint->gen != gen) {
+			hint->slot = U16_MAX;
+		}
+	}
+}
+
 /* 功能：在 arena 锁保护下把一条 shadow log 应用到页面所有权元数据；调用时机：context switch drain ring 时调用。 */
 static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 				     const struct md_shadow_log *entry,
@@ -982,6 +1020,7 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 		memset(arena->page_prefault + start, prefault, nr_pages);
 		memset32(arena->page_owner_gen + start, owner_gen, nr_pages);
 		arena->owner_table[slot].ref_pages += nr_pages;
+		md_assign_chunk_owner_locked(arena, start, end, slot, owner_gen);
 		md_mark_dirty_chunks(dirty_chunks, start, end);
 		md_record_pte_delta_locked(arena, pending_seq,
 					   MD_PTE_DELTA_REVOKE_NON_OWNER,
@@ -1070,6 +1109,7 @@ static int md_apply_log_entry_locked(struct md_arena_meta *arena,
 				md_put_owner_slot_locked(arena, slot);
 			}
 		}
+		md_assign_chunk_owner_locked(arena, start, end, MD_INVALID_SLOT, 0);
 		md_mark_dirty_chunks(dirty_chunks, start, end);
 		if (!external_backend)
 			md_record_pte_delta_locked(arena, pending_seq,
@@ -1506,6 +1546,8 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 	arena->page_allocation = kvcalloc(nr_pages, sizeof(u64), GFP_KERNEL);
 	arena->page_block = kvcalloc(nr_pages, sizeof(u64), GFP_KERNEL);
 	arena->page_generation = kvcalloc(nr_pages, sizeof(u64), GFP_KERNEL);
+	arena->chunk_owner = kvcalloc(arena->nr_chunks,
+				      sizeof(*arena->chunk_owner), GFP_KERNEL);
 	arena->chunk_gen = kvcalloc(arena->nr_chunks, sizeof(*arena->chunk_gen),
 				    GFP_KERNEL);
 	/* Keep the larger arena bitmap off scheduler/exit kernel stacks. */
@@ -1515,7 +1557,8 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 	arena->delta_runs = kvcalloc(MD_PTE_DELTA_RUN_CAPACITY,
 				     sizeof(*arena->delta_runs), GFP_KERNEL);
 	if (!arena->page_slot || !arena->page_free || !arena->page_prefault ||
-	    !arena->page_owner_gen || !arena->chunk_gen || !arena->dirty_chunks ||
+	    !arena->page_owner_gen || !arena->chunk_gen || !arena->chunk_owner ||
+	    !arena->dirty_chunks ||
 	    !arena->owner_table || !arena->delta_runs ||
 	    !arena->page_allocation || !arena->page_block || !arena->page_generation) {
 		kvfree(arena->page_allocation);
@@ -1523,6 +1566,7 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 		kvfree(arena->page_generation);
 		kvfree(arena->delta_runs);
 		kvfree(arena->owner_table);
+		kvfree(arena->chunk_owner);
 		kvfree(arena->chunk_gen);
 		bitmap_free(arena->dirty_chunks);
 		kvfree(arena->page_owner_gen);
@@ -1534,6 +1578,12 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 	}
 
 	memset(arena->page_slot, MD_INVALID_SLOT, nr_pages);
+	{
+		u32 chunk;
+
+		for (chunk = 0; chunk < arena->nr_chunks; chunk++)
+			arena->chunk_owner[chunk].slot = MD_INVALID_SLOT;
+	}
 
 	mutex_lock(&md_arena_table_lock);
 	old_arena = rcu_dereference_protected(md_arenas[cpu],
@@ -1548,6 +1598,7 @@ int memory_delegation_arena_register(unsigned int cpu, unsigned int nr_pages,
 		kvfree(arena->page_generation);
 		kvfree(arena->delta_runs);
 		kvfree(arena->owner_table);
+		kvfree(arena->chunk_owner);
 		kvfree(arena->chunk_gen);
 		bitmap_free(arena->dirty_chunks);
 		kvfree(arena->page_owner_gen);
@@ -1596,6 +1647,7 @@ void memory_delegation_arena_unregister(unsigned int cpu)
 	kvfree(arena->page_generation);
 	kvfree(arena->delta_runs);
 	kvfree(arena->owner_table);
+	kvfree(arena->chunk_owner);
 	kvfree(arena->chunk_gen);
 	bitmap_free(arena->dirty_chunks);
 	kvfree(arena->page_owner_gen);
@@ -2111,68 +2163,92 @@ static int md_close_sync_gap_locked(struct mm_struct *mm,
 	return 0;
 }
 
-static bool md_delta_run_owner_is_mm(unsigned int cpu,
-				     const struct md_pte_delta_run *run,
-				     struct mm_struct *mm)
+static int md_delta_address_cmp(const void *a, const void *b)
 {
-	struct md_arena_meta *arena;
-	bool match = false;
+	const struct md_pte_delta_run *left = a, *right = b;
 
-	rcu_read_lock();
-	arena = md_get_arena_rcu(cpu);
-	if (arena) {
-		spin_lock(&arena->lock);
-		if (run->owner_slot < arena->owner_slots) {
-			struct md_owner_entry *owner =
-				&arena->owner_table[run->owner_slot];
-
-			match = owner->valid && owner->mm == mm &&
-				owner->gen == run->owner_gen;
-		}
-		spin_unlock(&arena->lock);
-	}
-	rcu_read_unlock();
-
-	return match;
+	if (left->start_page != right->start_page)
+		return left->start_page < right->start_page ? -1 : 1;
+	return (left->nr_pages > right->nr_pages) -
+		(left->nr_pages < right->nr_pages);
 }
 
-static bool md_delta_free_prefault_still_valid(unsigned int cpu,
-					       const struct md_pte_delta_run *run)
+static int md_add_final_revoke(struct md_page_range *ranges, u32 *count,
+			       u32 start, u32 end)
 {
-	struct md_arena_meta *arena;
-	bool valid = false;
-
-	rcu_read_lock();
-	arena = md_get_arena_rcu(cpu);
-	if (arena) {
-		spin_lock(&arena->lock);
-		valid = run->start_page < arena->nr_pages &&
-			arena->page_slot[run->start_page] == MD_INVALID_SLOT &&
-			arena->page_free[run->start_page];
-		spin_unlock(&arena->lock);
+	if (*count && ranges[*count - 1].end == start) {
+		ranges[*count - 1].end = end;
+		return 0;
 	}
-	rcu_read_unlock();
-
-	return valid;
+	if (*count == MD_FINAL_RANGE_CAPACITY)
+		return -EAGAIN;
+	ranges[*count].start = start;
+	ranges[(*count)++].end = end;
+	return 0;
 }
 
-/* Revoke operations commute until a prefault: merge their contiguous union
- * without expanding over holes or moving an unmap across a prefault barrier.
+/* Only select revokes under the truth lock. No PTE is installed from a
+ * snapshot, so a racing update can at worst require another revoke pass.
  */
-static void md_flush_delta_unmap(struct mm_struct *mm,
-				 unsigned long *start, unsigned long *end,
-				 bool *pte_modified,
-				 struct md_pte_sync_detail *detail)
+static int md_select_final_revokes_locked(struct md_arena_meta *arena,
+		struct mm_struct *mm, const struct md_pte_delta_run *runs,
+		u32 count, struct md_page_range *ranges, u32 *nr_ranges)
 {
-	if (*end > *start) {
-		MD_TIME_START(unmap, "pte_delta_unmap");
-		md_unmap_range_locked(mm, *start, *end);
-		MD_DETAIL_ADD(detail, unmap_cycles, MD_TIME_END(unmap));
-		MD_DETAIL_INC(detail, unmap_ranges);
-		MD_DETAIL_ADD(detail, unmap_pages, (*end - *start) >> PAGE_SHIFT);
-		*pte_modified = true;
+	u32 chunk_pages = md_current_chunk_pages();
+	u32 mixed_pages = 0, i;
+
+	for (i = 0; i < count; i++) {
+		u32 page = runs[i].start_page;
+		u32 end = page + runs[i].nr_pages;
+
+		while (page < end) {
+			u32 chunk = page / chunk_pages;
+			u32 stop = min(end, (chunk + 1) * chunk_pages);
+			struct md_chunk_owner *hint = &arena->chunk_owner[chunk];
+			bool accessible;
+			int ret;
+
+			if (hint->slot == U16_MAX) {
+				u32 first;
+
+				if (stop - page > MD_FINAL_MIXED_PAGES_MAX - mixed_pages)
+					return -EAGAIN;
+				mixed_pages += stop - page;
+				while (page < stop) {
+					if (arena->page_slot[page] == MD_INVALID_SLOT ||
+					    md_page_belongs_to_mm_locked(arena, page, mm)) {
+						page++;
+						continue;
+					}
+					first = page++;
+					while (page < stop &&
+					       arena->page_slot[page] != MD_INVALID_SLOT &&
+					       !md_page_belongs_to_mm_locked(arena, page, mm))
+						page++;
+					ret = md_add_final_revoke(ranges, nr_ranges,
+								 first, page);
+					if (ret)
+						return ret;
+				}
+				continue;
+			}
+			accessible = hint->slot == MD_INVALID_SLOT;
+			if (!accessible && hint->slot < arena->owner_slots) {
+				struct md_owner_entry *owner =
+					&arena->owner_table[hint->slot];
+
+				accessible = owner->valid && owner->mm == mm &&
+					owner->gen == hint->gen;
+			}
+			if (!accessible) {
+				ret = md_add_final_revoke(ranges, nr_ranges, page, stop);
+				if (ret)
+					return ret;
+			}
+			page = stop;
+		}
 	}
-	*start = *end = 0;
+	return 0;
 }
 
 /* 功能：尝试用 bounded delta run ring 同步 PTE；返回 -EAGAIN 时调用方回退 chunk 扫描。 */
@@ -2190,7 +2266,8 @@ static int md_sync_mm_from_deltas(struct mm_struct *mm, unsigned int cpu,
 	u32 wanted = 0;
 	u32 count = 0;
 	u32 i;
-	unsigned long unmap_start = 0, unmap_end = 0;
+	struct md_page_range *revokes;
+	u32 nr_revokes = 0, merged = 0, indexed = 0;
 	int ret = 0;
 	MD_TIME_START(scan, "pte_delta_scan");
 
@@ -2300,7 +2377,7 @@ static int md_sync_mm_from_deltas(struct mm_struct *mm, unsigned int cpu,
 			MD_DETAIL_ADD(detail, scan_cycles, MD_TIME_END(scan));
 			return -EAGAIN;
 		}
-		/* Backward lookup, chronological replay (including prefaults). */
+		/* Copy the retained suffix; address order is normalized below. */
 		runs[wanted - 1 - count++] = *run;
 	}
 	spin_unlock(&arena->lock);
@@ -2312,60 +2389,112 @@ static int md_sync_mm_from_deltas(struct mm_struct *mm, unsigned int cpu,
 		return -EAGAIN;
 	}
 
+	/* Delta is an address index, not a list of PTE commands. Preserve the
+	 * legacy metadata-prefault contract via the final-state chunk fallback.
+	 */
 	for (i = 0; i < count; i++) {
-		const struct md_pte_delta_run *run = &runs[i];
-		unsigned long start = arena_base +
-			(unsigned long)run->start_page * PAGE_SIZE;
-		unsigned long end = start +
-			(unsigned long)run->nr_pages * PAGE_SIZE;
-
 		MD_DETAIL_INC(detail, delta_runs);
-		if (run->op == MD_PTE_DELTA_REVOKE_NON_OWNER) {
-			MD_DETAIL_INC(detail, delta_revoke_runs);
-			if (md_delta_run_owner_is_mm(cpu, run, mm))
-				continue;
-
-			if (unmap_end > unmap_start &&
-			    (start > unmap_end || end < unmap_start))
-				md_flush_delta_unmap(mm, &unmap_start, &unmap_end,
-						     pte_modified, detail);
-			if (unmap_end > unmap_start) {
-				unmap_start = min(unmap_start, start);
-				unmap_end = max(unmap_end, end);
-			} else {
-				unmap_start = start;
-				unmap_end = end;
-			}
-			continue;
+		if (runs[i].op != MD_PTE_DELTA_REVOKE_NON_OWNER) {
+			if (runs[i].op == MD_PTE_DELTA_PREFAULT_FREE)
+				MD_DETAIL_INC(detail, delta_prefault_runs);
+			ret = -EAGAIN;
+			goto out_runs;
 		}
+		MD_DETAIL_INC(detail, delta_revoke_runs);
+		/* Collapse a chronological overlapping/adjacent cluster first.
+		 * The common same-address reuse case then needs no sort at all.
+		 */
+		if (indexed && runs[i].start_page <=
+			    runs[indexed - 1].start_page + runs[indexed - 1].nr_pages &&
+		    runs[indexed - 1].start_page <=
+			    runs[i].start_page + runs[i].nr_pages) {
+			struct md_pte_delta_run *prev = &runs[indexed - 1];
+			u32 end = max(prev->start_page + prev->nr_pages,
+				      runs[i].start_page + runs[i].nr_pages);
 
-		if (run->op == MD_PTE_DELTA_PREFAULT_FREE) {
-			MD_DETAIL_INC(detail, delta_prefault_runs);
-			md_flush_delta_unmap(mm, &unmap_start, &unmap_end,
-					     pte_modified, detail);
-			if (!md_delta_free_prefault_still_valid(cpu, run))
-				continue;
-
-			MD_TIME_START(prefault, "pte_delta_prefault");
-			ret = md_prefault_range_locked(mm, start, end);
-			MD_DETAIL_ADD(detail, prefault_cycles,
-				      MD_TIME_END(prefault));
-			MD_DETAIL_INC(detail, prefault_ranges);
-			MD_DETAIL_ADD(detail, prefault_pages, run->nr_pages);
-			if (ret) {
-				ret = -EAGAIN;
-				MD_DETAIL_INC(detail, delta_fallbacks);
-				break;
-			}
-			*pte_modified = true;
-			continue;
+			prev->start_page = min(prev->start_page, runs[i].start_page);
+			prev->nr_pages = end - prev->start_page;
+		} else {
+			runs[indexed++] = runs[i];
 		}
-
-		ret = -EAGAIN;
-		MD_DETAIL_INC(detail, delta_fallbacks);
-		break;
 	}
-	md_flush_delta_unmap(mm, &unmap_start, &unmap_end, pte_modified, detail);
+	count = indexed;
+	if (count > 1)
+		sort(runs, count, sizeof(*runs), md_delta_address_cmp, NULL);
+	for (i = 0; i < count; i++) {
+		struct md_pte_delta_run *run = &runs[i];
+
+		if (merged && run->start_page <= runs[merged - 1].start_page +
+						 runs[merged - 1].nr_pages) {
+			struct md_pte_delta_run *prev = &runs[merged - 1];
+
+			prev->nr_pages = max(prev->start_page + prev->nr_pages,
+					    run->start_page + run->nr_pages) -
+				prev->start_page;
+		} else {
+			runs[merged++] = *run;
+		}
+	}
+	if (merged > MD_FINAL_RANGE_CAPACITY) {
+		ret = -EAGAIN;
+		goto out_runs;
+	}
+	revokes = kcalloc(MD_FINAL_RANGE_CAPACITY, sizeof(*revokes), GFP_KERNEL);
+	if (!revokes) {
+		ret = -EAGAIN;
+		goto out_runs;
+	}
+	rcu_read_lock();
+	arena = md_get_arena_rcu(cpu);
+	if (!arena) {
+		ret = -ENOENT;
+	} else {
+		spin_lock(&arena->lock);
+		if (arena->global_commit_seq != target_seq)
+			ret = -EAGAIN;
+		else
+			ret = md_select_final_revokes_locked(arena, mm, runs,
+							    merged, revokes, &nr_revokes);
+		spin_unlock(&arena->lock);
+	}
+	rcu_read_unlock();
+	if (ret)
+		goto out_revokes;
+
+	for (i = 0; i < nr_revokes; i++) {
+		unsigned long start = arena_base +
+			(unsigned long)revokes[i].start * PAGE_SIZE;
+		unsigned long end = arena_base +
+			(unsigned long)revokes[i].end * PAGE_SIZE;
+		MD_TIME_START(unmap, "pte_final_unmap");
+
+		ret = md_unmap_range_locked(mm, start, end);
+		MD_DETAIL_ADD(detail, unmap_cycles, MD_TIME_END(unmap));
+		MD_DETAIL_INC(detail, unmap_ranges);
+		MD_DETAIL_ADD(detail, unmap_pages, revokes[i].end - revokes[i].start);
+		*pte_modified = true;
+		if (ret)
+			goto out_revokes;
+	}
+	/* Revoke-only snapshot validation: never claim completion for a raced
+	 * pass. The caller rechecks final truth through the chunk fallback.
+	 */
+	rcu_read_lock();
+	arena = md_get_arena_rcu(cpu);
+	if (!arena) {
+		ret = -ENOENT;
+	} else {
+		spin_lock(&arena->lock);
+		if (arena->global_commit_seq != target_seq)
+			ret = -EAGAIN;
+		spin_unlock(&arena->lock);
+	}
+	rcu_read_unlock();
+out_revokes:
+	kfree(revokes);
+out_runs:
+	if (ret == -EAGAIN)
+		MD_DETAIL_INC(detail, delta_fallbacks);
 
 	MD_DETAIL_ADD(detail, scan_cycles, MD_TIME_END(scan));
 	kfree(runs);
@@ -2433,7 +2562,6 @@ static int md_memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 	if (ret != -EAGAIN)
 		goto out_put_ctx;
 	ret = 0;
-	pte_modified = false;
 
 	MD_TIME_START(scan, "pte_sync_scan");
 	for (chunk = 0; chunk < nr_chunks;) {
@@ -2713,6 +2841,7 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 				continue;
 			/* Descriptors cannot be reconstructed safely after owner death. */
 			arena->page_slot[i] = MD_RECLAIM_PENDING_SLOT;
+			arena->chunk_owner[i / md_current_chunk_pages()].slot = U16_MAX;
 			arena->page_free[i] = 0;
 			arena->page_prefault[i] = 0;
 			arena->page_owner_gen[i] = 0;
