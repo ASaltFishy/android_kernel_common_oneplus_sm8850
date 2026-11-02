@@ -344,3 +344,35 @@ mm/memory.c
 rg -n "memory_delegation_(arena_register|register_ring|on_context_switch|sync_mm|fault_allowed|mm_release|fork_mm)" \
   mm kernel include
 ```
+
+
+## ctx 锁／中断与退出并发回归
+
+在全新四 CPU QEMU guest 中运行（Linux 静态程序，不直接在手机跑压力）：
+
+```bash
+make -C tools/testing/memory_delegation/tests MODE=linux ctx_irq_exit_stress
+# 将 tests/out/ctx_irq_exit_stress 放入 guest /bin 后：
+/bin/ctx_irq_exit_stress 2000 2048
+```
+
+参数为每个退出 worker 的循环数、每 CPU Arena MiB；两个 worker 合计 4002 次退出，
+四个 Arena 仅预留稀疏 VA/backing，不触碰整个 8 GiB。成功要求正常子进程退出、实际发生
+定时器唤醒，并输出 PASS(ctx_irq_exit)。guest watchdog/外部 timeout 必须作为失败处理。
+旧内核也可能通过本压力程序；真机 minidump 和持锁时 IRQ 状态是死锁诊断的独立证据。
+
+
+自动检查持 ctx 锁时的保存 PSTATE.I（要求 1），并执行退出压力：
+
+```bash
+python3 tools/testing/memory_delegation/scripts/run_ctx_irq_exit_qemu.py \
+  --image /path/to/dist/Image --vmlinux /path/to/dist/vmlinux \
+  --busybox /path/to/static-aarch64-busybox \
+  --test-binary tools/testing/memory_delegation/tests/out/ctx_irq_exit_stress \
+  --out-dir /tmp/ctx-irq-qemu --objdump /path/to/llvm-objdump
+```
+
+Image 与 vmlinux 必须来自同一构建。runner 从反汇编自动定位获取锁后的指令；
+动态 kprobe 读取保存的 `%pstate`，而非 trace handler 的当前 IRQ 标志。
+未修复版本输出 IRQ_STATE FAIL，即使压力程序正常退出也返回非零；修复版要求
+IRQ_STATE PASS、正常退出且无 panic/BUG/WARNING。仅在 guest 中安装临时探针。

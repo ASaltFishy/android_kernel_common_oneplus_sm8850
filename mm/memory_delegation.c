@@ -152,6 +152,12 @@ static DEFINE_HASHTABLE(md_mm_ctx_table, MD_MM_CTX_HASH_BITS);
 static DEFINE_HASHTABLE(md_active_mm_table, MD_ACTIVE_MM_HASH_BITS);
 static DEFINE_HASHTABLE(md_session_table, MD_MM_CTX_HASH_BITS);
 static atomic64_t md_next_session = ATOMIC64_INIT(0);
+/*
+ * Lock order: rq->lock -> arena->lock -> md_mm_ctx_table_lock (locks may
+ * be skipped). Scheduler callers already have IRQs disabled. Process callers
+ * must disable IRQs too: an interrupt that wakes a task can otherwise wait for
+ * rq->lock while its owner waits here, deadlocking the entire machine.
+ */
 static DEFINE_SPINLOCK(md_mm_ctx_table_lock);
 static struct md_arena_meta __rcu *md_arenas[NR_CPUS];
 static unsigned int md_chunk_pages __read_mostly = MD_CHUNK_PAGES_DEFAULT;
@@ -363,6 +369,7 @@ static bool md_active_mm_get_locked(struct mm_struct *mm,
 static int md_mm_ctx_activate(struct md_mm_ctx *ctx, u64 initial_last_seen,
 			      gfp_t gfp)
 {
+	unsigned long ctx_irqflags;
 	struct md_active_mm *new_active;
 	bool activated = false;
 	int ret = 0;
@@ -370,25 +377,25 @@ static int md_mm_ctx_activate(struct md_mm_ctx *ctx, u64 initial_last_seen,
 	if (!ctx)
 		return -EINVAL;
 
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	if (ctx->dead) {
-		spin_unlock(&md_mm_ctx_table_lock);
+		spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 		return -EINVAL;
 	}
 	if (ctx->active) {
-		spin_unlock(&md_mm_ctx_table_lock);
+		spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 		return 0;
 	}
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 
 	new_active = kzalloc(sizeof(*new_active), gfp);
 	if (!new_active)
 		return -ENOMEM;
 
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	if (!ctx->dead && !ctx->active) {
 		if (!md_active_mm_get_locked(ctx->key.mm, new_active)) {
-			spin_unlock(&md_mm_ctx_table_lock);
+			spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 			kfree(new_active);
 			return -ENOMEM;
 		}
@@ -398,7 +405,7 @@ static int md_mm_ctx_activate(struct md_mm_ctx *ctx, u64 initial_last_seen,
 	}
 	if (ctx->dead)
 		ret = -EINVAL;
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 
 	if (!activated)
 		kfree(new_active);
@@ -459,20 +466,21 @@ static void md_sync_task_work(struct callback_head *work);
 static struct md_mm_ctx *md_mm_ctx_get_or_create(struct mm_struct *mm,
 						 unsigned int cpu, gfp_t gfp)
 {
+	unsigned long ctx_irqflags;
 	struct md_mm_ctx_key key = {
 		.mm = mm,
 		.cpu = cpu,
 	};
 	struct md_mm_ctx *ctx, *new_ctx;
 
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	ctx = md_mm_ctx_lookup_locked(&key);
 	if (ctx && !ctx->dead) {
 		refcount_inc(&ctx->refs);
-		spin_unlock(&md_mm_ctx_table_lock);
+		spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 		return ctx;
 	}
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 
 	new_ctx = kzalloc(sizeof(*new_ctx), gfp);
 	if (!new_ctx)
@@ -482,15 +490,15 @@ static struct md_mm_ctx *md_mm_ctx_get_or_create(struct mm_struct *mm,
 	refcount_set(&new_ctx->refs, 2);
 	init_task_work(&new_ctx->sync_work, md_sync_task_work);
 
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	ctx = md_mm_ctx_lookup_locked(&key);
 	if (!ctx || ctx->dead) {
 		hash_add(md_mm_ctx_table, &new_ctx->node, md_mm_ctx_hash(&key));
-		spin_unlock(&md_mm_ctx_table_lock);
+		spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 		return new_ctx;
 	}
 	refcount_inc(&ctx->refs);
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 
 	kfree(new_ctx);
 	return ctx;
@@ -500,19 +508,20 @@ static struct md_mm_ctx *md_mm_ctx_get_or_create(struct mm_struct *mm,
 static struct md_mm_ctx *md_mm_ctx_lookup_get(struct mm_struct *mm,
 					      unsigned int cpu)
 {
+	unsigned long ctx_irqflags;
 	struct md_mm_ctx_key key = {
 		.mm = mm,
 		.cpu = cpu,
 	};
 	struct md_mm_ctx *ctx;
 
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	ctx = md_mm_ctx_lookup_locked(&key);
 	if (ctx && !ctx->dead)
 		refcount_inc(&ctx->refs);
 	else
 		ctx = NULL;
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 
 	return ctx;
 }
@@ -1233,6 +1242,7 @@ static int md_apply_shared_locked(struct md_arena_meta *arena, unsigned int cpu,
 		const struct md_shared_record *record, bool remote,
 		unsigned long *dirty, struct md_switch_cycle_stats *stats)
 {
+	unsigned long ctx_irqflags;
 	struct md_mm_ctx *ctx;
 	struct md_shadow_log entry;
 	u32 start = record->start_page, end, i;
@@ -1247,7 +1257,7 @@ static int md_apply_shared_locked(struct md_arena_meta *arena, unsigned int cpu,
 	    end > arena->nr_pages)
 		return -EINVAL;
 
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	hash_for_each_possible(md_session_table, ctx, session_node, record->session) {
 		if (ctx->session == record->session && ctx->key.cpu == cpu &&
 		    ctx->active && !ctx->dead && ctx->arena_id == arena->id)
@@ -1294,7 +1304,7 @@ found:
 	}
 	/* Keep allocation identity after FREE to reject delayed/partial requests. */
 out:
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 	return ret;
 }
 
@@ -1456,6 +1466,29 @@ static bool md_queue_sync_if_needed(struct md_mm_ctx *ctx,
 	return true;
 }
 
+/* A RUNNING callback can be marked RERUN when it resumes from waiting for
+ * mmap_lock, before its current pass has published last_seen_gen. Recheck the
+ * completed generation BEFORE joining the mmap writer queue again. The inner
+ * sync still rechecks under mmap_lock and is the only completion publisher.
+ * Missing/replaced metadata is deliberately not treated as completed work.
+ */
+static bool md_sync_ctx_needs_work(struct md_mm_ctx *ctx)
+{
+	struct md_arena_meta *arena;
+	bool needed = true;
+
+	rcu_read_lock();
+	arena = md_get_arena_rcu(ctx->key.cpu);
+	if (arena && READ_ONCE(arena->id) == READ_ONCE(ctx->arena_id)) {
+		u64 latest = READ_ONCE(arena->global_commit_seq);
+
+		/* Pair with completion publication after PTE/TLB synchronization. */
+		needed = latest > smp_load_acquire(&ctx->last_seen_gen);
+	}
+	rcu_read_unlock();
+	return needed;
+}
+
 /* 功能：在可睡眠 task_work 上下文中执行当前 mm 的 arena 页表同步；调用时机：task 返回用户态前由 task_work 调用。 */
 static void md_sync_task_work(struct callback_head *work)
 {
@@ -1475,24 +1508,26 @@ static void md_sync_task_work(struct callback_head *work)
 			unsigned int state;
 			bool this_pte_modified = false;
 			struct md_pte_sync_detail this_detail = {};
-			MD_TIME_START(lock_wait, "pte_sync_mmap_lock_wait");
+			if (md_sync_ctx_needs_work(ctx)) {
+				MD_TIME_START(lock_wait, "pte_sync_mmap_lock_wait");
 
-			mmap_write_lock(mm);
-			MD_DETAIL_ADD(&this_detail, lock_wait_cycles,
-				      MD_TIME_END(lock_wait));
-			MD_TIME_START(lock_hold, "pte_sync_mmap_lock_hold");
-			md_memory_delegation_sync_mm(mm, ctx->key.cpu, arena_base,
-						     &this_pte_modified,
-						     stats_enabled ?
-						     &this_detail : NULL);
-			MD_DETAIL_ADD(&this_detail, lock_hold_cycles,
-				      MD_TIME_END(lock_hold));
-			mmap_write_unlock(mm);
-			if (unlikely(stats_enabled)) {
-				md_pte_sync_detail_add(&total_detail,
-						       &this_detail);
+				mmap_write_lock(mm);
+				MD_DETAIL_ADD(&this_detail, lock_wait_cycles,
+					      MD_TIME_END(lock_wait));
+				MD_TIME_START(lock_hold, "pte_sync_mmap_lock_hold");
+				md_memory_delegation_sync_mm(mm, ctx->key.cpu, arena_base,
+							     &this_pte_modified,
+							     stats_enabled ?
+							     &this_detail : NULL);
+				MD_DETAIL_ADD(&this_detail, lock_hold_cycles,
+					      MD_TIME_END(lock_hold));
+				mmap_write_unlock(mm);
+				if (unlikely(stats_enabled)) {
+					md_pte_sync_detail_add(&total_detail,
+							       &this_detail);
+				}
+				pte_modified |= this_pte_modified;
 			}
-			pte_modified |= this_pte_modified;
 
 			state = cmpxchg(&ctx->sync_state, MD_SYNC_RUNNING,
 					MD_SYNC_IDLE);
@@ -1538,6 +1573,7 @@ static void md_sync_task_work(struct callback_head *work)
 /* Caller has stopped all producers; busy queues/owners retain their pins. */
 static bool md_shared_can_unregister(struct md_arena_meta *arena)
 {
+	unsigned long ctx_irqflags;
 	struct md_shared_log *logs = arena->logs;
 	struct md_mm_ctx *ctx;
 	unsigned int bkt;
@@ -1550,14 +1586,14 @@ static bool md_shared_can_unregister(struct md_arena_meta *arena)
 		return false;
 	spin_lock_irq(&arena->lock);
 	/* Existing registered mm contexts must detach by exit before teardown. */
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	hash_for_each(md_mm_ctx_table, bkt, ctx, node) {
 		if (ctx->active && !ctx->dead && ctx->arena_id == arena->id) {
 			idle = false;
 			break;
 		}
 	}
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 	if (READ_ONCE(logs->normal.reserved) != arena->normal_head ||
 	    READ_ONCE(logs->remote.reserved) != arena->remote_head ||
 	    smp_load_acquire(&logs->remote.reclaimed) != arena->remote_head)
@@ -1750,6 +1786,7 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 				     unsigned long request_addr,
 				     unsigned long flags)
 {
+	unsigned long ctx_irqflags;
 	struct md_shared_registration req;
 	struct md_shared_log *logs = NULL;
 	struct md_arena_meta *arena;
@@ -1915,7 +1952,7 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 	ret = md_mm_ctx_activate(ctx, 0, GFP_KERNEL);
 	if (ret)
 		goto unlock;
-	spin_lock_irq(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	if (!ctx->session) {
 		/* Never use PID, a raw mm pointer, or an owner slot as a session ID. */
 		u64 session = atomic64_inc_return(&md_next_session);
@@ -1929,7 +1966,7 @@ int memory_delegation_register_ring(unsigned int cpu, unsigned long arena_base,
 		}
 	}
 	req.session = ctx->session;
-	spin_unlock_irq(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
  unlock:
 	mutex_unlock(&md_arena_table_lock);
 	if (!ret && copy_to_user((void __user *)request_addr, &req, sizeof(req)))
@@ -2643,7 +2680,7 @@ static int md_memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 	ret = md_sync_mm_from_deltas(mm, cpu, arena_base, nr_pages, last_seen,
 				     target_seq, &pte_modified, detail);
 	if (!ret) {
-		WRITE_ONCE(ctx->last_seen_gen, target_seq);
+		smp_store_release(&ctx->last_seen_gen, target_seq);
 		goto out_put_ctx;
 	}
 	if (ret != -EAGAIN)
@@ -2789,7 +2826,7 @@ static int md_memory_delegation_sync_mm(struct mm_struct *mm, unsigned int cpu,
 	MD_DETAIL_ADD(detail, scan_cycles, MD_TIME_END(scan));
 
 	if (!ret && target_seq > READ_ONCE(ctx->last_seen_gen))
-		WRITE_ONCE(ctx->last_seen_gen, target_seq);
+		smp_store_release(&ctx->last_seen_gen, target_seq);
 
 out_put_ctx:
 	md_mm_ctx_put(ctx);
@@ -2875,6 +2912,7 @@ EXPORT_SYMBOL_GPL(memory_delegation_fork_mm);
 /* Expire sessions before quarantining; never consume or free shared log storage. */
 void memory_delegation_mm_release(struct mm_struct *mm)
 {
+	unsigned long ctx_irqflags;
 	struct md_mm_ctx *ctx;
 	struct hlist_node *tmp;
 	unsigned int cpu, bkt;
@@ -2883,7 +2921,7 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 	if (!mm)
 		return;
 	had_active = md_mm_has_active_ctx(mm);
-	spin_lock(&md_mm_ctx_table_lock);
+	spin_lock_irqsave(&md_mm_ctx_table_lock, ctx_irqflags);
 	hash_for_each_safe(md_mm_ctx_table, bkt, tmp, ctx, node) {
 		if (ctx->key.mm != mm)
 			continue;
@@ -2897,7 +2935,7 @@ void memory_delegation_mm_release(struct mm_struct *mm)
 		hash_del(&ctx->node);
 		md_mm_ctx_put(ctx);
 	}
-	spin_unlock(&md_mm_ctx_table_lock);
+	spin_unlock_irqrestore(&md_mm_ctx_table_lock, ctx_irqflags);
 
 	if (!had_active)
 		return;

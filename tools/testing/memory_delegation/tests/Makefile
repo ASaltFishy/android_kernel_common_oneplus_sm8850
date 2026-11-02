@@ -78,6 +78,12 @@ $(OUT_DIR):
 	@mkdir -p "$(OUT_DIR)"
 
 
+.PHONY: ctx_irq_exit_stress
+ctx_irq_exit_stress: $(OUT_DIR)/ctx_irq_exit_stress
+
+$(OUT_DIR)/ctx_irq_exit_stress: ctx_irq_exit_stress.c shared_log_v2.h ../../../../include/uapi/linux/memory_delegation.h | $(OUT_DIR)
+	$(CC) $(CFLAGS_COMMON) $< -o $@
+
 scudo_shared_arena_test: $(OUT_DIR)/scudo_shared_arena_test
 scudo_shared_arena_latency_bench: $(OUT_DIR)/scudo_shared_arena_latency_bench
 shared_arena_image_pipeline_app: $(OUT_DIR)/shared_arena_image_pipeline_app
